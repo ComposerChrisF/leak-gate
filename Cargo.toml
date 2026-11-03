@@ -1,0 +1,16 @@
+[package]
+name = "leak-gate"
+version = "0.1.0"
+edition = "2021"
+# The gate is a shell script, `scripts/leak-gate`; this package only runs its tests.  Repositories
+# take the script at a pinned commit, never from crates.io.
+publish = false
+description = "Refuse a commit that would publish a private reference: home paths, unresolvable bug and plan IDs, and a private list of names."
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/ComposerChrisF/leak-gate"
+
+[dev-dependencies]
+tempfile = "3"
+
+[target.'cfg(unix)'.dev-dependencies]
+libc = "0.2"

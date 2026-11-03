@@ -1,0 +1,234 @@
+#!/usr/bin/env bash
+# leak-gate: refuse any private reference in what this repository would publish.
+#
+# It scans the index (what is committed, or about to be) of every tracked file, except the paths a
+# tracked `.leak-gate-exclude` at the repository root lists, one per line, each a file or a
+# directory taken literally (blank lines and lines starting with `#` are skipped), for files the
+# repository never publishes; it names them on stderr each run.  Without that file every tracked
+# file is scanned, and a new file is scanned by default, so the gate fails closed.  A binary file
+# is matched byte for byte, so text in it stored as UTF-16 or in a compressed stream is not seen,
+# and a home path or a private name in it is reported as the whole file.
+#
+# Two layers:
+#   generic  Committed here, and run by CI and by the pre-commit hook: absolute home paths other
+#            than the test fixtures' `alice` (`/Users/<name>`, `/home/<name>`, `C:\Users\<name>`;
+#            the exception cannot apply to a binary file), paths into the home directory's
+#            `.claude` folder (`~`, `$HOME`, or `${HOME}`), and bug or plan ID citations, in a
+#            file's contents or in its path, that a history cut from its predecessor's cannot
+#            resolve: an ID that is not four digits at or above its series' floor, or any ID of a
+#            series with no floor.  An ID counts wherever it does not follow a letter or digit, so
+#            `_` and a letter that is not ASCII separate it from what is before it.  A floor is
+#            `bugs/FLOOR` or `plans/FLOOR`, a tracked regular file whose one line that is not blank
+#            or a `#` comment names the series' lowest ID, above 0000.
+#   private  Names that must not be published, so never committed: one extended regular
+#            expression per line in $LEAK_GATE_PATTERNS (a relative value is read from the
+#            directory the gate is run in), else ~/.config/leak-gate/patterns.txt (a line starting
+#            with `#` is a comment), matched as whole words (`_` separates words), ignoring case,
+#            in every tracked file's contents and in its path.  When the default list is absent
+#            the layer is skipped, with a notice on stderr; a list set in $LEAK_GATE_PATTERNS must
+#            exist.
+#
+# Usage: scripts/leak-gate [--require-private | --help]
+#   --require-private  An absent default list, or an empty list, is exit 4, not a notice.  Use it
+#                      for the final scan before publishing.
+#   --help             Print this text.
+#
+# Exit: 0 clean; 1 the gate itself failed (git, grep, or perl; a pattern file it cannot read or
+#       that $LEAK_GATE_PATTERNS names and is not there; a floor not in the form above; or
+#       exclusions that leave nothing to scan); 2 usage error; 3 findings; 4 --require-private
+#       and no private patterns.
+
+set -uo pipefail
+
+require_private=0
+case $# in
+    0) ;;
+    1) case $1 in
+           --require-private) require_private=1 ;;
+           --help) sed -n '2,/^$/s/^# \{0,1\}//p' "$0"; exit 0 ;;
+           *) echo "leak-gate: unknown argument: $1" >&2; exit 2 ;;
+       esac ;;
+    *) echo "leak-gate: expected at most one argument, --require-private or --help" >&2; exit 2 ;;
+esac
+
+# A list set in $LEAK_GATE_PATTERNS is the caller's: it must exist, and a relative value is read
+# from the caller's directory, so it is resolved before the cd below.
+if [ -n "${LEAK_GATE_PATTERNS:-}" ]; then
+    explicit=1
+    case $LEAK_GATE_PATTERNS in
+        /*) list=$LEAK_GATE_PATTERNS ;;
+        *) list=$PWD/$LEAK_GATE_PATTERNS ;;
+    esac
+else
+    explicit=0
+    list=$HOME/.config/leak-gate/patterns.txt
+fi
+
+root=$(git rev-parse --show-toplevel) || exit 1
+cd "$root" || exit 1
+
+# Sets $tracked to 1 when a path is tracked, $mode to its mode in the index, and $content to its
+# text there; or $tracked to 0 and the others to nothing.
+read_tracked() {
+    local listed
+    listed=$(git ls-files --cached --stage -- "$1") || { echo "leak-gate: git ls-files failed" >&2; exit 1; }
+    tracked=0 mode="" content=""
+    [ -n "$listed" ] || return 0
+    tracked=1
+    mode=${listed%% *}
+    content=$(git show ":$1") || { echo "leak-gate: cannot read $1 from the index" >&2; exit 1; }
+}
+
+# Sets $lines to the lines of $content that are neither blank nor a `#` comment.
+significant() {
+    lines=$(grep -v -E '^[[:space:]]*(#|$)' <<<"$content")
+    [ $? -le 1 ] || { echo "leak-gate: grep failed" >&2; exit 1; }
+}
+
+scope=(-- .)
+read_tracked .leak-gate-exclude
+significant
+if [ -n "$lines" ]; then
+    while IFS= read -r line; do
+        scope+=(":(exclude,literal)$line")
+    done <<<"$lines"
+    echo "leak-gate: not scanning what .leak-gate-exclude lists: $(tr '\n' ' ' <<<"$lines")" >&2
+fi
+
+# Sets $floor to the ID number a tracked <series>/FLOOR names, or above every ID when the series
+# has none, so that each of its IDs is refused.  A tracked floor that is not in the header's form
+# stops the gate: a floor it could not read must never pass as no floor, or as a low one.
+read_floor() {
+    local file=$1 prefix=$2
+    read_tracked "$file"
+    if [ "$tracked" -eq 0 ]; then
+        floor=100000
+        return 0
+    fi
+    significant
+    case $mode in 100644 | 100755) ;; *) lines="" ;; esac
+    if ! grep -q -x -E "$prefix-[0-9]{4}" <<<"$lines" || [ "$(grep -c '' <<<"$lines")" -ne 1 ] ||
+        [ "$((10#${lines#"$prefix"-}))" -lt 1 ]; then
+        echo "leak-gate: $file is not a regular file naming one $prefix ID above 0000" >&2
+        exit 1
+    fi
+    floor=$((10#${lines#"$prefix"-}))
+}
+read_floor bugs/FLOOR bug
+bug_floor=$floor
+read_floor plans/FLOOR plan
+plan_floor=$floor
+
+found=0
+
+# Sets $out to git grep's matches over the scope.  git grep exits 1 for "no match" and above 1
+# when it failed, which must never read as clean.
+grep_index() {
+    out=$(git grep --cached --no-color -n "$@" "${scope[@]}")
+    local status=$?
+    if [ "$status" -gt 1 ]; then
+        echo "leak-gate: git grep failed (exit $status)" >&2
+        exit 1
+    fi
+    [ "$status" -eq 0 ] || out=""
+}
+
+# A tracked file's path is published too.  Unquoted, so a name that is not ASCII stays itself.
+paths=$(git -c core.quotePath=false ls-files --cached "${scope[@]}") || { echo "leak-gate: git ls-files failed" >&2; exit 1; }
+if [ -z "$paths" ]; then
+    all=$(git ls-files --cached) || { echo "leak-gate: git ls-files failed" >&2; exit 1; }
+    [ -z "$all" ] || { echo "leak-gate: .leak-gate-exclude leaves nothing to scan" >&2; exit 1; }
+fi
+
+# Sets $out to the tracked paths that match, the same way.
+grep_paths() {
+    out=$(grep "$@" <<<"$paths")
+    local status=$?
+    if [ "$status" -gt 1 ]; then
+        echo "leak-gate: grep failed over the tracked paths (exit $status)" >&2
+        exit 1
+    fi
+    [ "$status" -eq 0 ] || out=""
+}
+
+report() {
+    local rule=$1 lines=$2
+    [ -n "$lines" ] || return 0
+    found=1
+    while IFS= read -r line; do
+        printf 'leak: %s: %s\n' "$rule" "$line"
+    done <<<"$lines"
+}
+
+# A user name is any run of characters up to a separator, a space, or the punctuation that ends a
+# path in prose, so a name that is not ASCII is caught too.
+name="[^][:space:]/\\\\<>\"'\`(){}|*?:,;[]+"
+grep_index -o -E '(/(Users|home)/|[A-Za-z]:\\\\?Users\\\\?)'"$name"
+report "absolute home path" "$(printf '%s\n' "$out" | grep -v -E ':(/(Users|home)/|[A-Za-z]:\\\\?Users\\\\?)alice$')"
+
+grep_index -E '(~|[$]HOME|[$][{]HOME[}])/[.]claude'
+report "path into the home .claude folder" "$out"
+
+# An ID, after the start of a line or a character that is not a letter or digit, so `_` separates
+# words.  Matched with LC_ALL=C, byte for byte, so a letter that is not ASCII separates words too,
+# and with -o, so each match ends in the ID it found, binary files included.
+id_re='(^|[^[:alnum:]])(bug|plan)-[0-9]{3,4}'
+
+# Prints each line of $1 whose ID, at its end, is not four digits at or above its series' floor.
+below_floor() {
+    local line f re='(bug|plan)-([0-9]+)$'
+    while IFS= read -r line; do
+        [ -n "$line" ] || continue
+        if ! [[ $line =~ $re ]]; then
+            printf '%s\n' "$line"
+            continue
+        fi
+        case ${BASH_REMATCH[1]} in bug) f=$bug_floor ;; *) f=$plan_floor ;; esac
+        if [ "${#BASH_REMATCH[2]}" -ne 4 ] || [ "$((10#${BASH_REMATCH[2]}))" -lt "$f" ]; then
+            printf '%s\n' "$line"
+        fi
+    done <<<"$1"
+}
+
+LC_ALL=C grep_index -a -o -E "$id_re"
+report "bug or plan ID citation" "$(below_floor "$out")"
+
+# grep -n numbers the matches by path, so each is reported with its path.
+LC_ALL=C grep_paths -n -o -E "$id_re"
+path_list=()
+while IFS= read -r line; do path_list+=("$line"); done <<<"$paths"
+hits=""
+while IFS=: read -r n match; do
+    [ -n "$n" ] && hits+="${path_list[n - 1]}:$match"$'\n'
+done <<<"$out"
+report "bug or plan ID in a path" "$(below_floor "$hits")"
+
+# Only a proven "no such file" (ENOENT) is absence; anything else this lstat cannot answer is a
+# list the gate could not read.  Bash cannot see errno, so perl looks.
+patterns=""
+perl -e 'exit(lstat($ARGV[0]) ? 0 : $!{ENOENT} ? 1 : 2)' -- "$list"
+case $? in
+    0) [ -r "$list" ] || { echo "leak-gate: cannot read the private list $list" >&2; exit 1; }
+       patterns=$(grep -v -E '^[[:space:]]*(#|$)' "$list")
+       [ $? -le 1 ] || { echo "leak-gate: cannot read the private list $list" >&2; exit 1; } ;;
+    1) [ "$explicit" -eq 0 ] || { echo "leak-gate: LEAK_GATE_PATTERNS names $list, which does not exist" >&2; exit 1; } ;;
+    *) echo "leak-gate: cannot tell whether the private list $list exists" >&2; exit 1 ;;
+esac
+if [ -n "$patterns" ]; then
+    # A name is a whole word, and `_` separates words, as in a Rust file name or identifier; `-w`
+    # would count `_` as part of the word.
+    words=$(printf '%s\n' "$patterns" | sed 's/.*/(^|[^[:alnum:]])(&)([^[:alnum:]]|$)/') ||
+        { echo "leak-gate: sed failed over the private list" >&2; exit 1; }
+    grep_index -i -E -f <(printf '%s\n' "$words")
+    report "private name" "$out"
+    grep_paths -i -E -f <(printf '%s\n' "$words")
+    report "private name in a path" "$out"
+else
+    echo "leak-gate: no private patterns at $list; scanned the generic layer only" >&2
+    [ "$require_private" -eq 0 ] || exit 4
+fi
+
+if [ "$found" -eq 1 ]; then
+    echo "leak-gate: replace each reference above with the reason it stands for" >&2
+    exit 3
+fi
