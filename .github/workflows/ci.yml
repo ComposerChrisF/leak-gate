@@ -17,7 +17,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
-      - run: scripts/leak-gate
+      - run: scripts/leak-gate --generic-only
 
   # The tests are Unix-only, as the script is.
   test:

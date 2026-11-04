@@ -82,6 +82,13 @@ impl Fixture {
         c.output().unwrap()
     }
 
+    /// Writes `text` to `rel` under the scratch home's `.config/leak-gate`.
+    fn config_file(&self, rel: &str, text: &str) {
+        let path = self.home().join(".config").join("leak-gate").join(rel);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, text).unwrap();
+    }
+
     /// The gate over the repository, with an empty private list: the generic layer alone.
     fn generic_gate(&self) -> Output {
         let empty = self.tmp.path().join("empty-patterns.txt");
@@ -481,4 +488,178 @@ fn leak_gate_help_prints_its_header() {
     let text = String::from_utf8_lossy(&out.stdout);
     assert_eq!(out.status.code(), Some(0), "{}", show(&out));
     assert!(text.contains("Exit: 0 clean;"), "{text}");
+}
+
+/// A list the repository names in `.leak-gate.toml` is read in place of the default list, even
+/// with CRLF line endings; the settings are read from the index; and only a tracked
+/// `.leak-gate.toml` names a list.
+#[test]
+fn a_named_private_list_replaces_the_default() {
+    let settings = "# The private list.\n\nprivate-list = \"proj.x-1\"  # this repository's\n";
+    let fx = Fixture::new(&[
+        (".leak-gate.toml", settings.as_bytes()),
+        ("a.txt", b"namedname\n"),
+        ("b.txt", b"defaultname\n"),
+    ]);
+    fx.config_file("lists/proj.x-1.txt", "namedname\n");
+    fx.config_file("patterns.txt", "defaultname\n");
+    let out = fx.gate_in(&fx.repo(), None, &[]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert_eq!(out.status.code(), Some(3), "{}", show(&out));
+    assert!(
+        stdout.contains("a.txt") && !stdout.contains("b.txt"),
+        "{}",
+        show(&out)
+    );
+
+    fx.config_file("lists/proj.x-1.txt", "namedname\r\n");
+    let out = fx.gate_in(&fx.repo(), None, &[]);
+    assert_eq!(out.status.code(), Some(3), "a CRLF list: {}", show(&out));
+
+    // An unstaged edit is not what the commit publishes.
+    fs::write(fx.repo().join(".leak-gate.toml"), "# names no list\n").unwrap();
+    let out = fx.gate_in(&fx.repo(), None, &[]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        out.status.code() == Some(3) && stdout.contains("a.txt") && !stdout.contains("b.txt"),
+        "an unstaged edit to .leak-gate.toml: {}",
+        show(&out)
+    );
+
+    let untracked = Fixture::new(&[("b.txt", b"defaultname\n")]);
+    fs::write(untracked.repo().join(".leak-gate.toml"), settings).unwrap();
+    untracked.config_file("patterns.txt", "defaultname\n");
+    let out = untracked.gate_in(&untracked.repo(), None, &[]);
+    assert_eq!(
+        out.status.code(),
+        Some(3),
+        "an untracked .leak-gate.toml: {}",
+        show(&out)
+    );
+}
+
+/// A list the repository names must exist and hold a pattern, with or without
+/// `--require-private`; the default list is never read in its place.
+#[test]
+fn a_named_private_list_that_is_absent_or_empty_is_exit_4() {
+    let fx = Fixture::new(&[
+        (".leak-gate.toml", b"private-list = \"proj\"\n"),
+        ("a.txt", b"clean\n"),
+    ]);
+    fx.config_file("patterns.txt", "defaultname\n");
+    for args in [&[][..], &["--require-private"][..]] {
+        let out = fx.gate_in(&fx.repo(), None, args);
+        assert_eq!(
+            out.status.code(),
+            Some(4),
+            "absent, {args:?}: {}",
+            show(&out)
+        );
+    }
+    for text in ["", "# only a comment\n\n"] {
+        fx.config_file("lists/proj.txt", text);
+        let out = fx.gate_in(&fx.repo(), None, &[]);
+        assert_eq!(out.status.code(), Some(4), "{text:?}: {}", show(&out));
+    }
+}
+
+/// `--generic-only` runs the generic layer alone, whatever names a list, and says so.
+#[test]
+fn generic_only_skips_the_private_layer() {
+    let fx = Fixture::new(&[
+        (".leak-gate.toml", b"private-list = \"proj\"\n"),
+        ("a.txt", b"namedname\n"),
+    ]);
+    let out = fx.gate_in(&fx.repo(), None, &["--generic-only"]);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "a named list absent: {}",
+        show(&out)
+    );
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("--generic-only:"),
+        "{}",
+        show(&out)
+    );
+
+    let patterns = fx.tmp.path().join("patterns.txt");
+    fs::write(&patterns, "namedname\n").unwrap();
+    let out = fx.gate_in(&fx.repo(), Some(&patterns), &["--generic-only"]);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "LEAK_GATE_PATTERNS set: {}",
+        show(&out)
+    );
+
+    let leak = format!("{}\n", home_path());
+    let fx = Fixture::new(&[("a.txt", leak.as_bytes())]);
+    let out = fx.gate_in(&fx.repo(), None, &["--generic-only"]);
+    assert_eq!(out.status.code(), Some(3), "a home path: {}", show(&out));
+
+    let out = fx.gate_in(&fx.repo(), None, &["--generic-only", "--require-private"]);
+    assert_eq!(out.status.code(), Some(2), "both flags: {}", show(&out));
+}
+
+/// `LEAK_GATE_PATTERNS` still overrides a list the repository names.
+#[test]
+fn leak_gate_patterns_overrides_a_named_list() {
+    let fx = Fixture::new(&[
+        (".leak-gate.toml", b"private-list = \"proj\"\n"),
+        ("a.txt", b"envname\n"),
+    ]);
+    let patterns = fx.tmp.path().join("patterns.txt");
+    fs::write(&patterns, "envname\n").unwrap();
+    let out = fx.gate_in(&fx.repo(), Some(&patterns), &[]);
+    assert_eq!(out.status.code(), Some(3), "{}", show(&out));
+}
+
+/// A `.leak-gate.toml` the gate cannot read in the header's form stops it, under `--generic-only`
+/// too: a setting it could not read must never pass as no setting.
+#[test]
+fn a_leak_gate_toml_not_in_its_form_is_exit_1() {
+    let texts = [
+        "private-list = proj\n",
+        "private-list = 'proj'\n",
+        "private_list = \"proj\"\n",
+        "private-list = \"proj\"\nprivate-list = \"other\"\n",
+        "private-list = \"../proj\"\n",
+        "private-list = \".proj\"\n",
+        "private-list = \"\"\n",
+        "private-list = \"a#b\"\n",
+        "[gate]\nprivate-list = \"proj\"\n",
+        "\0\n",
+        "private-list = \"pr\0oj\"\n",
+    ];
+    for text in texts {
+        let fx = Fixture::new(&[(".leak-gate.toml", text.as_bytes()), ("a.txt", b"clean\n")]);
+        fx.config_file("lists/proj.txt", "namedname\n");
+        for args in [&[][..], &["--generic-only"][..]] {
+            let out = fx.gate_in(&fx.repo(), None, args);
+            assert_eq!(
+                out.status.code(),
+                Some(1),
+                "{text:?}, {args:?}: {}",
+                show(&out)
+            );
+        }
+    }
+
+    // A symlink's blob is its target's name, so the name is itself a valid setting here: only the
+    // regular-file check refuses it.
+    let fx = Fixture::new(&[("a.txt", b"clean\n")]);
+    std::os::unix::fs::symlink("private-list = \"proj\"", fx.repo().join(".leak-gate.toml"))
+        .unwrap();
+    fx.git(&["add", ".leak-gate.toml"]);
+    fx.config_file("lists/proj.txt", "namedname\n");
+    for args in [&[][..], &["--generic-only"][..]] {
+        let out = fx.gate_in(&fx.repo(), None, args);
+        assert_eq!(
+            out.status.code(),
+            Some(1),
+            "a symlink, {args:?}: {}",
+            show(&out)
+        );
+    }
 }

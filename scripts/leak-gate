@@ -21,34 +21,51 @@
 #            `bugs/FLOOR` or `plans/FLOOR`, a tracked regular file whose one line that is not blank
 #            or a `#` comment names the series' lowest ID, above 0000.
 #   private  Names that must not be published, so never committed: one extended regular
-#            expression per line in $LEAK_GATE_PATTERNS (a relative value is read from the
-#            directory the gate is run in), else ~/.config/leak-gate/patterns.txt (a line starting
-#            with `#` is a comment), matched as whole words (`_` separates words), ignoring case,
-#            in every tracked file's contents and in its path.  When the default list is absent
-#            the layer is skipped, with a notice on stderr; a list set in $LEAK_GATE_PATTERNS must
-#            exist.
+#            expression per line (a line starting with `#` is a comment, and a line's trailing
+#            carriage return is dropped, so a list saved with CRLF line endings still matches),
+#            matched as whole words (`_` separates words), ignoring case, in every tracked file's
+#            contents and in its path.  The list is the first of these that applies:
+#              1. $LEAK_GATE_PATTERNS, which must exist (a relative value is read from the
+#                 directory the gate is run in);
+#              2. ~/.config/leak-gate/lists/<key>.txt, when the repository's `.leak-gate.toml`
+#                 names it with `private-list = "<key>"`.  A list the repository names must
+#                 exist and hold a pattern, or the gate stops with exit 4;
+#              3. ~/.config/leak-gate/patterns.txt.  When it is absent the layer is skipped, with a
+#                 notice on stderr.
+#            --generic-only skips the layer, whatever names a list.
 #
-# Usage: scripts/leak-gate [--require-private | --help]
+# Settings: a tracked `.leak-gate.toml` at the repository root, read from the index.  It is a
+# small part of TOML: one `key = "value"` per line, the value holding no `"`, `\`, or `#`, with
+# blank lines and `#` comments.  The one key is `private-list`, whose value is a list's key:
+# letters, digits, `.`, `_`, and `-`, starting with a letter or digit.  The key is published with
+# the file, so it must not itself be private.  Any other key, a key set twice, a line not in this
+# form, or a `.leak-gate.toml` that is not a regular file stops the gate: a setting it could not
+# read must never pass as no setting.
+#
+# Usage: scripts/leak-gate [--require-private | --generic-only | --help]
 #   --require-private  An absent default list, or an empty list, is exit 4, not a notice.  Use it
 #                      for the final scan before publishing.
+#   --generic-only     Run the generic layer alone, and say so on stderr.  Use it in CI, where no
+#                      private list is.
 #   --help             Print this text.
 #
 # Exit: 0 clean; 1 the gate itself failed (git, grep, or perl; a pattern file it cannot read or
-#       that $LEAK_GATE_PATTERNS names and is not there; a floor not in the form above; or
-#       exclusions that leave nothing to scan); 2 usage error; 3 findings; 4 --require-private
-#       and no private patterns.
+#       that $LEAK_GATE_PATTERNS names and is not there; a floor or a `.leak-gate.toml` not in the
+#       form above; or exclusions that leave nothing to scan); 2 usage error; 3 findings; 4 no
+#       private patterns, with --require-private or from a list the repository names.
 
 set -uo pipefail
 
-require_private=0
+require_private=0 generic_only=0
 case $# in
     0) ;;
     1) case $1 in
            --require-private) require_private=1 ;;
+           --generic-only) generic_only=1 ;;
            --help) sed -n '2,/^$/s/^# \{0,1\}//p' "$0"; exit 0 ;;
            *) echo "leak-gate: unknown argument: $1" >&2; exit 2 ;;
        esac ;;
-    *) echo "leak-gate: expected at most one argument, --require-private or --help" >&2; exit 2 ;;
+    *) echo "leak-gate: expected at most one argument, --require-private, --generic-only, or --help" >&2; exit 2 ;;
 esac
 
 # A list set in $LEAK_GATE_PATTERNS is the caller's: it must exist, and a relative value is read
@@ -84,6 +101,41 @@ significant() {
     lines=$(grep -v -E '^[[:space:]]*(#|$)' <<<"$content")
     [ $? -le 1 ] || { echo "leak-gate: grep failed" >&2; exit 1; }
 }
+
+# The repository's settings, in the header's form, or the gate stops.  The blob goes to perl as it
+# is: bash would drop a NUL from it, and could turn a corrupt file into an empty one.
+list_key=""
+read_tracked .leak-gate.toml
+if [ "$tracked" -eq 1 ]; then
+    case $mode in
+        100644 | 100755) ;;
+        *) echo "leak-gate: .leak-gate.toml is not a regular file" >&2; exit 1 ;;
+    esac
+    settings=$(git show ":.leak-gate.toml" | perl -e '
+        my ($n, %seen) = (0);
+        while (my $line = <STDIN>) {
+            $n++;
+            chomp $line;
+            next if $line =~ /^\s*(?:#.*)?$/;
+            my ($key, $value) = $line =~ /^\s*([A-Za-z0-9_-]+)\s*=\s*"([^"\\#]*)"\s*(?:#.*)?$/
+                or die "leak-gate: .leak-gate.toml line $n is not in the form key = \"value\"\n";
+            $key eq "private-list" or die "leak-gate: .leak-gate.toml line $n: unknown key $key\n";
+            $seen{$key}++ and die "leak-gate: .leak-gate.toml line $n: $key is set twice\n";
+            $value =~ /^[A-Za-z0-9][A-Za-z0-9._-]*$/
+                or die "leak-gate: .leak-gate.toml line $n: a list key is letters, digits, ., _, and -, starting with a letter or digit\n";
+            print "$key\t$value\n";
+        }') || exit 1
+    while IFS=$'\t' read -r key value; do
+        case $key in private-list) list_key=$value ;; esac
+    done <<<"$settings"
+fi
+
+# A list the repository names takes the place of the default, and must hold a pattern.
+named=0
+if [ "$explicit" -eq 0 ] && [ -n "$list_key" ]; then
+    named=1
+    list=$HOME/.config/leak-gate/lists/$list_key.txt
+fi
 
 scope=(-- .)
 read_tracked .leak-gate-exclude
@@ -206,26 +258,33 @@ report "bug or plan ID in a path" "$(below_floor "$hits")"
 # Only a proven "no such file" (ENOENT) is absence; anything else this lstat cannot answer is a
 # list the gate could not read.  Bash cannot see errno, so perl looks.
 patterns=""
-perl -e 'exit(lstat($ARGV[0]) ? 0 : $!{ENOENT} ? 1 : 2)' -- "$list"
-case $? in
-    0) [ -r "$list" ] || { echo "leak-gate: cannot read the private list $list" >&2; exit 1; }
-       patterns=$(grep -v -E '^[[:space:]]*(#|$)' "$list")
-       [ $? -le 1 ] || { echo "leak-gate: cannot read the private list $list" >&2; exit 1; } ;;
-    1) [ "$explicit" -eq 0 ] || { echo "leak-gate: LEAK_GATE_PATTERNS names $list, which does not exist" >&2; exit 1; } ;;
-    *) echo "leak-gate: cannot tell whether the private list $list exists" >&2; exit 1 ;;
-esac
-if [ -n "$patterns" ]; then
-    # A name is a whole word, and `_` separates words, as in a Rust file name or identifier; `-w`
-    # would count `_` as part of the word.
-    words=$(printf '%s\n' "$patterns" | sed 's/.*/(^|[^[:alnum:]])(&)([^[:alnum:]]|$)/') ||
-        { echo "leak-gate: sed failed over the private list" >&2; exit 1; }
-    grep_index -i -E -f <(printf '%s\n' "$words")
-    report "private name" "$out"
-    grep_paths -i -E -f <(printf '%s\n' "$words")
-    report "private name in a path" "$out"
+if [ "$generic_only" -eq 1 ]; then
+    echo "leak-gate: --generic-only: scanned the generic layer only" >&2
 else
-    echo "leak-gate: no private patterns at $list; scanned the generic layer only" >&2
-    [ "$require_private" -eq 0 ] || exit 4
+    perl -e 'exit(lstat($ARGV[0]) ? 0 : $!{ENOENT} ? 1 : 2)' -- "$list"
+    case $? in
+        0) [ -r "$list" ] || { echo "leak-gate: cannot read the private list $list" >&2; exit 1; }
+           patterns=$(grep -v -E '^[[:space:]]*(#|$)' "$list" | sed $'s/\r$//')
+           [ $? -le 1 ] || { echo "leak-gate: cannot read the private list $list" >&2; exit 1; } ;;
+        1) [ "$explicit" -eq 0 ] || { echo "leak-gate: LEAK_GATE_PATTERNS names $list, which does not exist" >&2; exit 1; } ;;
+        *) echo "leak-gate: cannot tell whether the private list $list exists" >&2; exit 1 ;;
+    esac
+    if [ -n "$patterns" ]; then
+        # A name is a whole word, and `_` separates words, as in a Rust file name or identifier;
+        # `-w` would count `_` as part of the word.
+        words=$(printf '%s\n' "$patterns" | sed 's/.*/(^|[^[:alnum:]])(&)([^[:alnum:]]|$)/') ||
+            { echo "leak-gate: sed failed over the private list" >&2; exit 1; }
+        grep_index -i -E -f <(printf '%s\n' "$words")
+        report "private name" "$out"
+        grep_paths -i -E -f <(printf '%s\n' "$words")
+        report "private name in a path" "$out"
+    elif [ "$named" -eq 1 ]; then
+        echo "leak-gate: .leak-gate.toml names the private list $list_key, and ~/.config/leak-gate/lists/$list_key.txt does not exist or holds no pattern; create it, or pass --generic-only where no list can be" >&2
+        exit 4
+    else
+        echo "leak-gate: no private patterns at $list; scanned the generic layer only" >&2
+        [ "$require_private" -eq 0 ] || exit 4
+    fi
 fi
 
 if [ "$found" -eq 1 ]; then
