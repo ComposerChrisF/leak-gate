@@ -5,6 +5,7 @@ The order of open work.
 ## Open
 
 - [ ] **Publish this repository** as `ComposerChrisF/leak-gate`, public, and run its CI.  It waits on the maintainer.
-- [ ] **Commit and tag messages:** `leak-gate message <file>` for a `commit-msg` hook, and `leak-gate range <A..B>` for CI over the commit and annotated tag messages a push adds.
+- [ ] **A pre-push hook:** `leak-gate range` over what each pushed ref adds, both layers, so that commits no `commit-msg` hook sees (cherry-pick, rebase, `am`, `--no-verify`) and every tag message are read for private names before they leave the machine.
+- [ ] **One copy of the CI case logic:** each repository’s CI would copy the step that turns an event into a range.  A reusable workflow here, pinned by commit, would keep one copy.  Decide when the first repository pins the gate.
 - [ ] **A home-relative path rule** in the generic layer: `~/`, `$HOME/`, `${HOME}/`, or `env!("HOME")`, followed by a folder that is not a dot-folder.
 - [ ] **A file-type rule:** `refuse-extensions` outside `allow-under`, set in `.leak-gate.toml`.

@@ -1,9 +1,9 @@
 //! `scripts/leak-gate`, run against scratch repositories.
 //!
-//! The script's header is its contract: it scans every tracked file, except the paths a tracked
-//! `.leak-gate-exclude` lists, matching private names, and bug or plan IDs below their series'
-//! floor, in a file's contents and in its path; exit 1 means "the gate itself failed", and 3 means
-//! findings.
+//! The script's header is its contract: it scans the index (every tracked file's contents and
+//! path, except the paths a tracked `.leak-gate-exclude` lists), a commit message, or the commit
+//! and tag messages in a range, for home paths, private names, and bug or plan IDs below their
+//! series' floor; exit 1 means "the gate itself failed", 3 means findings, and 4 setup needed.
 //!
 //! The leaking strings are assembled at run time, never spelled out here, so this file does not
 //! itself trip the gate it tests.
@@ -71,14 +71,44 @@ impl Fixture {
         );
     }
 
+    /// git in the repository, with an identity and no signing, whatever its outcome.
+    fn git_out(&self, args: &[&str]) -> Output {
+        self.command("git", &self.repo())
+            .args(["-c", "user.name=Test", "-c", "user.email=test@example.com"])
+            .args(["-c", "commit.gpgSign=false", "-c", "tag.gpgSign=false"])
+            .args(args)
+            .output()
+            .unwrap()
+    }
+
+    /// Commits what is staged with `message`, and returns the commit's ID.
+    fn commit(&self, message: &str) -> String {
+        let out = self.git_out(&["commit", "-q", "--allow-empty", "-m", message]);
+        assert!(out.status.success(), "fixture: commit: {}", show(&out));
+        let out = self.git_out(&["rev-parse", "HEAD"]);
+        String::from_utf8(out.stdout).unwrap().trim().to_string()
+    }
+
     /// The gate run in `dir`, with `LEAK_GATE_PATTERNS` set to `patterns` when it is given.
     fn gate_in(&self, dir: &Path, patterns: Option<&Path>, args: &[&str]) -> Output {
+        self.gate_env(dir, patterns, args, &[])
+    }
+
+    /// [`Fixture::gate_in`], with `env` set too.
+    fn gate_env(
+        &self,
+        dir: &Path,
+        patterns: Option<&Path>,
+        args: &[&str],
+        env: &[(&str, &str)],
+    ) -> Output {
         let script = Path::new(env!("CARGO_MANIFEST_DIR")).join("scripts/leak-gate");
         let mut c = self.command("bash", dir);
         c.arg(script).args(args);
         if let Some(p) = patterns {
             c.env("LEAK_GATE_PATTERNS", p);
         }
+        c.envs(env.iter().copied());
         c.output().unwrap()
     }
 
@@ -661,5 +691,452 @@ fn a_leak_gate_toml_not_in_its_form_is_exit_1() {
             "a symlink, {args:?}: {}",
             show(&out)
         );
+    }
+}
+
+/// The list `secretname`, written for `fx`, and its path.
+fn secret_list(fx: &Fixture) -> PathBuf {
+    let patterns = fx.tmp.path().join("patterns.txt");
+    fs::write(&patterns, "secretname\n").unwrap();
+    patterns
+}
+
+/// `message` refuses in a commit message what the index scan refuses in a file: both layers, with
+/// IDs judged against the floors in the index.
+#[test]
+fn message_refuses_what_the_index_scan_refuses() {
+    let fx = Fixture::new(&[("bugs/FLOOR", format!("{}\n", id("bug", 40)).as_bytes())]);
+    let patterns = secret_list(&fx);
+    let msg = fx.tmp.path().join("msg");
+    let cases = [
+        ("Fix the parser\n\nNothing private.\n".to_string(), Some(0)),
+        (format!("Fix {}\n", id("bug", 41)), Some(0)),
+        (format!("Fix {}\n", id("bug", 39)), Some(3)),
+        (format!("Fix {}\n", id("plan", 41)), Some(3)),
+        (format!("Fix it\n\nSee {}\n", home_path()), Some(3)),
+        (
+            format!("See {}\n", ["", "Users", "alice", "x"].join("/")),
+            Some(0),
+        ),
+        (
+            format!("See {}\n", ["~", ".claude", "rules"].join("/")),
+            Some(3),
+        ),
+        (format!("修复{}\n", id("bug", 39)), Some(3)),
+        ("Fix x\0secretname\n".to_string(), Some(3)),
+        ("Fix the secretname import\n".to_string(), Some(3)),
+    ];
+    for (text, want) in cases {
+        fs::write(&msg, &text).unwrap();
+        let out = fx.gate_in(
+            &fx.repo(),
+            Some(&patterns),
+            &["message", msg.to_str().unwrap()],
+        );
+        assert_eq!(out.status.code(), want, "{text:?}: {}", show(&out));
+    }
+    let out = fx.gate_in(
+        &fx.repo(),
+        Some(&patterns),
+        &["message", msg.to_str().unwrap()],
+    );
+    assert!(
+        String::from_utf8_lossy(&out.stdout).contains("message:1:"),
+        "a finding names where it is: {}",
+        show(&out)
+    );
+
+    let out = fx.gate_in(
+        &fx.repo(),
+        Some(&patterns),
+        &["--generic-only", "message", msg.to_str().unwrap()],
+    );
+    assert_eq!(out.status.code(), Some(0), "--generic-only: {}", show(&out));
+}
+
+/// git hands a `commit-msg` hook the message before its cleanup, and keeps comment lines for `-m`
+/// and `-F`, so every line is read: comment lines, the lines below a scissors line, and a line
+/// holding a byte that is not UTF-8, which GNU grep would otherwise pass over in a UTF-8 locale.
+#[test]
+fn message_reads_every_line() {
+    let fx = Fixture::new(&[("README.md", b"clean\n")]);
+    let patterns = secret_list(&fx);
+    let msg = fx.tmp.path().join("msg");
+    let scissors = "# ------------------------ >8 ------------------------";
+    let texts: [Vec<u8>; 5] = [
+        b"Subject\n\n# secretname is the client\n".to_vec(),
+        format!("Subject\n\n{scissors}\nsecretname below the cut\n").into_bytes(),
+        b"Subject\n\n#\tnew file:   secretname.txt\n".to_vec(),
+        b"Subject\n\nFix \xff secretname\n".to_vec(),
+        [
+            b"See \xff ".to_vec(),
+            ["~", ".claude", "x"].join("/").into_bytes(),
+            b"\n".to_vec(),
+        ]
+        .concat(),
+    ];
+    for text in texts {
+        fs::write(&msg, &text).unwrap();
+        let out = fx.gate_env(
+            &fx.repo(),
+            Some(&patterns),
+            &["message", msg.to_str().unwrap()],
+            &[("LC_ALL", "C.UTF-8")],
+        );
+        assert_eq!(
+            out.status.code(),
+            Some(3),
+            "{:?}: {}",
+            String::from_utf8_lossy(&text),
+            show(&out)
+        );
+    }
+}
+
+/// A message file is a caller-asserted input, read from the caller's directory; a command line
+/// wrong on its face is exit 2.
+#[test]
+fn message_and_range_arguments() {
+    let fx = Fixture::new(&[("sub/m.txt", b"Fix the secretname import\n")]);
+    let patterns = secret_list(&fx);
+    let missing = fx.tmp.path().join("no-such-message");
+    let out = fx.gate_in(
+        &fx.repo(),
+        Some(&patterns),
+        &["message", missing.to_str().unwrap()],
+    );
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "a missing message: {}",
+        show(&out)
+    );
+
+    let out = fx.gate_in(&fx.repo(), Some(&patterns), &["message", "sub"]);
+    assert_eq!(out.status.code(), Some(1), "a directory: {}", show(&out));
+
+    let out = fx.gate_in(
+        &fx.repo().join("sub"),
+        Some(&patterns),
+        &["message", "m.txt"],
+    );
+    assert_eq!(
+        out.status.code(),
+        Some(3),
+        "a relative message: {}",
+        show(&out)
+    );
+
+    for args in [
+        &["message"][..],
+        &["message", ""][..],
+        &["range"][..],
+        &["range", "-p"][..],
+        &["range", "--branches"][..],
+        &["range", "--all", "x"][..],
+        &["scan", "x"][..],
+        &["message", "a", "b"][..],
+        &["--help", "message", "a"][..],
+    ] {
+        let out = fx.gate_in(&fx.repo(), Some(&patterns), args);
+        assert_eq!(out.status.code(), Some(2), "{args:?}: {}", show(&out));
+    }
+}
+
+/// `range` scans the message of each commit in the range, and of each annotated tag that points
+/// to one of them, and only those.
+#[test]
+fn range_scans_commit_and_tag_messages() {
+    let fx = Fixture::new(&[("README.md", b"clean\n")]);
+    let patterns = secret_list(&fx);
+    let base = fx.commit("Start");
+    let leaky = fx.commit("Wire up secretname");
+    let clean = fx.commit("Tidy");
+    let gate = |range: &str, args: &[&str]| {
+        let mut all = args.to_vec();
+        all.extend(["range", range]);
+        fx.gate_in(&fx.repo(), Some(&patterns), &all)
+    };
+
+    let out = gate(&format!("{base}..HEAD"), &[]);
+    assert_eq!(out.status.code(), Some(3), "{}", show(&out));
+    assert!(
+        String::from_utf8_lossy(&out.stdout).contains(&format!("commit {}:1:", &leaky[..12])),
+        "{}",
+        show(&out)
+    );
+    let out = gate(&format!("{leaky}..HEAD"), &[]);
+    assert_eq!(out.status.code(), Some(0), "past the leak: {}", show(&out));
+    let out = gate("HEAD..HEAD", &[]);
+    assert_eq!(out.status.code(), Some(0), "an empty range: {}", show(&out));
+
+    let tag = fx.git_out(&["tag", "-a", "v1", "-m", "Release secretname", &clean]);
+    assert!(tag.status.success(), "{}", show(&tag));
+    let light = fx.git_out(&["tag", "light", &base]);
+    assert!(light.status.success(), "{}", show(&light));
+    let out = gate(&format!("{clean}^!"), &[]);
+    assert_eq!(
+        out.status.code(),
+        Some(3),
+        "a tag in the range: {}",
+        show(&out)
+    );
+    assert!(
+        String::from_utf8_lossy(&out.stdout).contains("tag v1:"),
+        "{}",
+        show(&out)
+    );
+    let out = gate(&format!("{base}^!"), &[]);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "a tag outside it: {}",
+        show(&out)
+    );
+
+    let home = fx.commit(&format!("Note {}", home_path()));
+    let out = gate(&format!("{home}^!"), &["--generic-only"]);
+    assert_eq!(
+        out.status.code(),
+        Some(3),
+        "the generic layer: {}",
+        show(&out)
+    );
+    let cited = fx.commit(&format!("Fix {}", id("bug", 2)));
+    let out = gate(&format!("{cited}^!"), &["--generic-only"]);
+    assert_eq!(
+        out.status.code(),
+        Some(3),
+        "an ID with no floor: {}",
+        show(&out)
+    );
+
+    let out = gate("no-such-rev..HEAD", &[]);
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "a revision git cannot find: {}",
+        show(&out)
+    );
+
+    // A tag of a tag publishes both messages, though the inner one has no ref of its own.
+    for args in [
+        &["tag", "-a", "inner", "-m", "Inner names secretname", &base][..],
+        &["tag", "-a", "outer", "-m", "Outer is clean", "inner"][..],
+        &["tag", "-d", "inner"][..],
+    ] {
+        let out = fx.git_out(args);
+        assert!(out.status.success(), "{args:?}: {}", show(&out));
+    }
+    let out = gate(&format!("{base}^!"), &[]);
+    assert_eq!(out.status.code(), Some(3), "a nested tag: {}", show(&out));
+    assert!(
+        String::from_utf8_lossy(&out.stdout).contains("tag outer:"),
+        "{}",
+        show(&out)
+    );
+}
+
+/// `range --all` reads every ref's history, and every range reads the objects a push would send,
+/// not their replacements.
+#[test]
+fn range_all_reads_every_ref_and_no_replacement() {
+    let fx = Fixture::new(&[("README.md", b"clean\n")]);
+    let patterns = secret_list(&fx);
+    let base = fx.commit("Start");
+    fx.git(&["checkout", "-q", "-b", "side"]);
+    let side = fx.commit("Side work on secretname");
+    fx.git(&["checkout", "-q", "-"]);
+
+    let out = fx.gate_in(&fx.repo(), Some(&patterns), &["range", "HEAD"]);
+    assert_eq!(out.status.code(), Some(0), "HEAD alone: {}", show(&out));
+    let out = fx.gate_in(&fx.repo(), Some(&patterns), &["range", "--all"]);
+    assert_eq!(out.status.code(), Some(3), "--all: {}", show(&out));
+
+    let replace = fx.git_out(&["replace", &side, &base]);
+    assert!(replace.status.success(), "{}", show(&replace));
+    let out = fx.gate_in(
+        &fx.repo(),
+        Some(&patterns),
+        &["range", &format!("{side}^!")],
+    );
+    assert_eq!(
+        out.status.code(),
+        Some(3),
+        "a replaced commit: {}",
+        show(&out)
+    );
+}
+
+/// A NUL in a tag's message is a line break: bash would drop it and join the words around it.
+#[test]
+fn range_reads_a_nul_as_a_line_break() {
+    let fx = Fixture::new(&[("README.md", b"clean\n")]);
+    let base = fx.commit("Start");
+    let tag = fx.tmp.path().join("tag");
+    fs::write(
+        &tag,
+        format!(
+            "object {base}\ntype commit\ntag nul\ntagger T <t@example.com> 0 +0000\n\nx\0{}\n",
+            id("bug", 2)
+        ),
+    )
+    .unwrap();
+    let out = fx.git_out(&[
+        "hash-object",
+        "-t",
+        "tag",
+        "-w",
+        "--literally",
+        tag.to_str().unwrap(),
+    ]);
+    assert!(out.status.success(), "{}", show(&out));
+    let sha = String::from_utf8(out.stdout).unwrap().trim().to_string();
+    fx.git(&["update-ref", "refs/tags/nul", &sha]);
+    let out = fx.gate_in(
+        &fx.repo(),
+        None,
+        &["--generic-only", "range", &format!("{base}^!")],
+    );
+    assert_eq!(out.status.code(), Some(3), "{}", show(&out));
+}
+
+/// A tag the gate cannot read stops it, and so does a shallow clone, whose history stops early:
+/// neither may pass as clean.
+#[test]
+fn range_fails_closed_on_what_it_cannot_read() {
+    let fx = Fixture::new(&[("README.md", b"clean\n")]);
+    let base = fx.commit("Start");
+    fx.commit("Next");
+    let shallow = fx.tmp.path().join("shallow");
+    let url = format!("file://{}", fx.repo().display());
+    let out = fx
+        .command("git", fx.tmp.path())
+        .args([
+            "clone",
+            "-q",
+            "--depth",
+            "1",
+            &url,
+            shallow.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{}", show(&out));
+    let out = fx.gate_in(&shallow, None, &["--generic-only", "range", "HEAD"]);
+    assert_eq!(
+        out.status.code(),
+        Some(4),
+        "a shallow clone: {}",
+        show(&out)
+    );
+
+    for args in [
+        &["tag", "-a", "inner", "-m", "Inner", &base][..],
+        &["tag", "-a", "outer", "-m", "Outer", "inner"][..],
+    ] {
+        let out = fx.git_out(args);
+        assert!(out.status.success(), "{args:?}: {}", show(&out));
+    }
+    let out = fx.git_out(&["rev-parse", "inner"]);
+    let inner = String::from_utf8(out.stdout).unwrap().trim().to_string();
+    fx.git(&["tag", "-d", "inner"]);
+    let object = fx
+        .repo()
+        .join(".git/objects")
+        .join(&inner[..2])
+        .join(&inner[2..]);
+    fs::remove_file(object).unwrap();
+    let out = fx.gate_in(
+        &fx.repo(),
+        None,
+        &["--generic-only", "range", &format!("{base}^!")],
+    );
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "an unreadable tag: {}",
+        show(&out)
+    );
+}
+
+/// The hook the gate is for: a commit whose message would leak is not made.
+#[test]
+fn a_commit_msg_hook_refuses_the_commit() {
+    let fx = Fixture::new(&[("README.md", b"clean\n")]);
+    fx.config_file("patterns.txt", "secretname\n");
+    let hooks = fx.tmp.path().join("hooks");
+    fs::create_dir(&hooks).unwrap();
+    let script = Path::new(env!("CARGO_MANIFEST_DIR")).join("scripts/leak-gate");
+    let hook = hooks.join("commit-msg");
+    fs::write(
+        &hook,
+        format!(
+            "#!/bin/sh\nexec bash '{}' message \"$1\"\n",
+            script.display()
+        ),
+    )
+    .unwrap();
+    fs::set_permissions(&hook, fs::Permissions::from_mode(0o755)).unwrap();
+    fx.git(&["config", "core.hooksPath", hooks.to_str().unwrap()]);
+
+    let out = fx.git_out(&["commit", "-q", "-m", "Add secretname support"]);
+    assert!(!out.status.success(), "{}", show(&out));
+    let head = fx.git_out(&["rev-parse", "--verify", "--quiet", "HEAD"]);
+    assert!(
+        !head.status.success(),
+        "the commit was made: {}",
+        show(&head)
+    );
+
+    let out = fx.git_out(&[
+        "commit",
+        "-q",
+        "-m",
+        "Add support",
+        "-m",
+        "# secretname is the client",
+    ]);
+    assert!(
+        !out.status.success(),
+        "a `#` line, which -m keeps: {}",
+        show(&out)
+    );
+    let head = fx.git_out(&["rev-parse", "--verify", "--quiet", "HEAD"]);
+    assert!(
+        !head.status.success(),
+        "the commit was made: {}",
+        show(&head)
+    );
+
+    let out = fx.git_out(&["commit", "-q", "-m", "Add support"]);
+    assert!(out.status.success(), "a clean message: {}", show(&out));
+}
+
+/// In a UTF-8 locale, git grep and macOS's grep match nothing on a line holding a byte that is not
+/// UTF-8, so a private name or a home path there passed the index scan.
+#[test]
+fn the_index_scan_reads_a_line_that_is_not_utf8() {
+    let home = [
+        b"see \xff ".to_vec(),
+        home_path().into_bytes(),
+        b"\n".to_vec(),
+    ]
+    .concat();
+    for (file, contents) in [
+        ("a.txt", b"Fix \xff secretname\n".to_vec()),
+        ("b.txt", home),
+    ] {
+        let fx = Fixture::new(&[(file, &contents[..])]);
+        let patterns = secret_list(&fx);
+        for locale in ["C.UTF-8", "en_US.UTF-8"] {
+            let out = fx.gate_env(&fx.repo(), Some(&patterns), &[], &[("LC_ALL", locale)]);
+            assert_eq!(
+                out.status.code(),
+                Some(3),
+                "{file}, {locale}: {}",
+                show(&out)
+            );
+        }
     }
 }

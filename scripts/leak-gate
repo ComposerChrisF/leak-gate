@@ -1,20 +1,40 @@
 #!/usr/bin/env bash
-# leak-gate: refuse any private reference in what this repository would publish.
+# leak-gate: refuse a private reference in what a repository publishes: its tracked files, and its
+# commit and tag messages.
 #
-# It scans the index (what is committed, or about to be) of every tracked file, except the paths a
-# tracked `.leak-gate-exclude` at the repository root lists, one per line, each a file or a
-# directory taken literally (blank lines and lines starting with `#` are skipped), for files the
-# repository never publishes; it names them on stderr each run.  Without that file every tracked
-# file is scanned, and a new file is scanned by default, so the gate fails closed.  A binary file
-# is matched byte for byte, so text in it stored as UTF-16 or in a compressed stream is not seen,
-# and a home path or a private name in it is reported as the whole file.
+# It scans one of three things:
+#   the index    With no command: what is committed, or about to be.  Every tracked file's contents
+#                and path, except the paths a tracked `.leak-gate-exclude` at the repository root
+#                lists, one per line, each a file or a directory taken literally (blank lines and
+#                lines starting with `#` are skipped), for files the repository never publishes; it
+#                names them on stderr each run.  Without that file every tracked file is scanned,
+#                and a new file is scanned by default, so the gate fails closed.  A binary file is
+#                matched byte for byte, so text in it stored as UTF-16 or in a compressed stream is
+#                not seen, and a home path or a private name in it is reported as the whole file.
+#   a message    `message <file>`: every line of one commit message file, for a `commit-msg` hook.
+#                git hands the hook the message before its cleanup, and the hook cannot tell which
+#                lines git will keep: git keeps comment lines for `-m` and `-F`, and a `--cleanup`
+#                flag is never visible to the hook.  So git's own comment lines, and the diff that
+#                `git commit -v` adds, are read too, and a private name in a line git would drop
+#                still refuses the commit: in an untracked file's name that git's template lists,
+#                say, or in a line that `-v` shows being removed.  Commit with `-m` or `-F`, or
+#                without `-v`, to avoid that.
+#   a range      `range <revisions>`: the message of every commit that `git rev-list <revisions>`
+#                lists, and of every annotated tag that points to one of them, through any tags it
+#                points to, for CI over what a push adds; `range --all`, every ref's history, for
+#                the scan before publishing.  The objects are read as a push sends them, replace
+#                refs ignored.  Only the messages: the files at each commit are not read, so a
+#                reference added and removed again within the range is not seen here.  In a
+#                shallow clone, whose history stops early, `range` refuses to run.
+# A NUL byte in a message is read as a line break.  Each finding is a line on stdout naming where it
+# is: a path, `message`, `commit <abbreviated sha>`, or `tag <name>`.
 #
-# Two layers:
-#   generic  Committed here, and run by CI and by the pre-commit hook: absolute home paths other
-#            than the test fixtures' `alice` (`/Users/<name>`, `/home/<name>`, `C:\Users\<name>`;
-#            the exception cannot apply to a binary file), paths into the home directory's
-#            `.claude` folder (`~`, `$HOME`, or `${HOME}`), and bug or plan ID citations, in a
-#            file's contents or in its path, that a history cut from its predecessor's cannot
+# Two layers, each over what is scanned:
+#   generic  Committed here, and run by CI and by the hooks: absolute home paths other than the
+#            test fixtures' `alice` (`/Users/<name>`, `/home/<name>`, `C:\Users\<name>`; the
+#            exception cannot apply to a binary file), paths into the home directory's `.claude`
+#            folder (`~`, `$HOME`, or `${HOME}`), and bug or plan ID citations, in a file's
+#            contents or path or in a message, that a history cut from its predecessor's cannot
 #            resolve: an ID that is not four digits at or above its series' floor, or any ID of a
 #            series with no floor.  An ID counts wherever it does not follow a letter or digit, so
 #            `_` and a letter that is not ASCII separate it from what is before it.  A floor is
@@ -24,7 +44,7 @@
 #            expression per line (a line starting with `#` is a comment, and a line's trailing
 #            carriage return is dropped, so a list saved with CRLF line endings still matches),
 #            matched as whole words (`_` separates words), ignoring case, in every tracked file's
-#            contents and in its path.  The list is the first of these that applies:
+#            contents and path, or in a message.  The list is the first of these that applies:
 #              1. $LEAK_GATE_PATTERNS, which must exist (a relative value is read from the
 #                 directory the gate is run in);
 #              2. ~/.config/leak-gate/lists/<key>.txt, when the repository's `.leak-gate.toml`
@@ -42,31 +62,54 @@
 # form, or a `.leak-gate.toml` that is not a regular file stops the gate: a setting it could not
 # read must never pass as no setting.
 #
-# Usage: scripts/leak-gate [--require-private | --generic-only | --help]
+# Usage: leak-gate [--require-private | --generic-only] [message <file> | range <revisions>]
+#        leak-gate --help
 #   --require-private  An absent default list, or an empty list, is exit 4, not a notice.  Use it
-#                      for the final scan before publishing.
+#                      for the final scans before publishing: the index, and `range --all`.
 #   --generic-only     Run the generic layer alone, and say so on stderr.  Use it in CI, where no
 #                      private list is.
+#   message <file>     Scan a commit message.  A relative <file> is read from the directory the
+#                      gate is run in.
+#   range <revisions>  Scan the messages in a range, as `git rev-list` takes one: `A..B`, or
+#                      `<rev>^!` for a single commit; or `--all`.
 #   --help             Print this text.
 #
 # Exit: 0 clean; 1 the gate itself failed (git, grep, or perl; a pattern file it cannot read or
 #       that $LEAK_GATE_PATTERNS names and is not there; a floor or a `.leak-gate.toml` not in the
-#       form above; or exclusions that leave nothing to scan); 2 usage error; 3 findings; 4 no
-#       private patterns, with --require-private or from a list the repository names.
+#       form above; exclusions that leave nothing to scan; a message file it cannot read; or
+#       revisions git cannot list); 2 usage error; 3 findings; 4 setup needed: no private patterns,
+#       with --require-private or from a list the repository names, or `range` in a shallow clone.
 
 set -uo pipefail
 
-require_private=0 generic_only=0
+usage="usage: leak-gate [--require-private | --generic-only] [message <file> | range <revisions>]"
+require_private=0 generic_only=0 command=index target=""
+case ${1-} in
+    --require-private) require_private=1; shift ;;
+    --generic-only) generic_only=1; shift ;;
+    --help)
+        [ $# -eq 1 ] || { echo "leak-gate: --help takes no other argument" >&2; exit 2; }
+        sed -n '2,/^$/s/^# \{0,1\}//p' "$0"; exit 0 ;;
+esac
 case $# in
     0) ;;
-    1) case $1 in
-           --require-private) require_private=1 ;;
-           --generic-only) generic_only=1 ;;
-           --help) sed -n '2,/^$/s/^# \{0,1\}//p' "$0"; exit 0 ;;
-           *) echo "leak-gate: unknown argument: $1" >&2; exit 2 ;;
+    2) case $1 in
+           message | range) command=$1 target=$2 ;;
+           *) echo "leak-gate: unknown command: $1; $usage" >&2; exit 2 ;;
        esac ;;
-    *) echo "leak-gate: expected at most one argument, --require-private, --generic-only, or --help" >&2; exit 2 ;;
+    *) echo "leak-gate: unexpected arguments: $*; $usage" >&2; exit 2 ;;
 esac
+case $command:$target in
+    message: | range:) echo "leak-gate: $command needs a non-empty argument; $usage" >&2; exit 2 ;;
+    range:--all) ;;
+    range:-*) echo "leak-gate: range takes revisions or --all, not another option: $target" >&2; exit 2 ;;
+esac
+
+# A message file is the caller's, read from the caller's directory, so it is resolved before the cd
+# below.
+if [ "$command" = message ]; then
+    case $target in /*) ;; *) target=$PWD/$target ;; esac
+fi
 
 # A list set in $LEAK_GATE_PATTERNS is the caller's: it must exist, and a relative value is read
 # from the caller's directory, so it is resolved before the cd below.
@@ -137,16 +180,6 @@ if [ "$explicit" -eq 0 ] && [ -n "$list_key" ]; then
     list=$HOME/.config/leak-gate/lists/$list_key.txt
 fi
 
-scope=(-- .)
-read_tracked .leak-gate-exclude
-significant
-if [ -n "$lines" ]; then
-    while IFS= read -r line; do
-        scope+=(":(exclude,literal)$line")
-    done <<<"$lines"
-    echo "leak-gate: not scanning what .leak-gate-exclude lists: $(tr '\n' ' ' <<<"$lines")" >&2
-fi
-
 # Sets $floor to the ID number a tracked <series>/FLOOR names, or above every ID when the series
 # has none, so that each of its IDs is refused.  A tracked floor that is not in the header's form
 # stops the gate: a floor it could not read must never pass as no floor, or as a low one.
@@ -173,36 +206,6 @@ plan_floor=$floor
 
 found=0
 
-# Sets $out to git grep's matches over the scope.  git grep exits 1 for "no match" and above 1
-# when it failed, which must never read as clean.
-grep_index() {
-    out=$(git grep --cached --no-color -n "$@" "${scope[@]}")
-    local status=$?
-    if [ "$status" -gt 1 ]; then
-        echo "leak-gate: git grep failed (exit $status)" >&2
-        exit 1
-    fi
-    [ "$status" -eq 0 ] || out=""
-}
-
-# A tracked file's path is published too.  Unquoted, so a name that is not ASCII stays itself.
-paths=$(git -c core.quotePath=false ls-files --cached "${scope[@]}") || { echo "leak-gate: git ls-files failed" >&2; exit 1; }
-if [ -z "$paths" ]; then
-    all=$(git ls-files --cached) || { echo "leak-gate: git ls-files failed" >&2; exit 1; }
-    [ -z "$all" ] || { echo "leak-gate: .leak-gate-exclude leaves nothing to scan" >&2; exit 1; }
-fi
-
-# Sets $out to the tracked paths that match, the same way.
-grep_paths() {
-    out=$(grep "$@" <<<"$paths")
-    local status=$?
-    if [ "$status" -gt 1 ]; then
-        echo "leak-gate: grep failed over the tracked paths (exit $status)" >&2
-        exit 1
-    fi
-    [ "$status" -eq 0 ] || out=""
-}
-
 report() {
     local rule=$1 lines=$2
     [ -n "$lines" ] || return 0
@@ -212,14 +215,30 @@ report() {
     done <<<"$lines"
 }
 
+# Sets $out to the lines in $1 and $2, each line once, in byte order.
+join_matches() {
+    out=$(printf '%s\n%s\n' "$1" "$2" | LC_ALL=C sort -u | LC_ALL=C sed '/^$/d')
+}
+
+# Sets $out to grep's matches over a text, the same way as grep_index below.
+grep_text() {
+    local text=$1 a b status
+    shift
+    a=$(grep "$@" <<<"$text")
+    status=$?
+    [ "$status" -le 1 ] || { echo "leak-gate: grep failed (exit $status)" >&2; exit 1; }
+    b=$(LC_ALL=C grep "$@" <<<"$text")
+    status=$?
+    [ "$status" -le 1 ] || { echo "leak-gate: grep failed (exit $status)" >&2; exit 1; }
+    join_matches "$a" "$b"
+}
+
 # A user name is any run of characters up to a separator, a space, or the punctuation that ends a
 # path in prose, so a name that is not ASCII is caught too.
 name="[^][:space:]/\\\\<>\"'\`(){}|*?:,;[]+"
-grep_index -o -E '(/(Users|home)/|[A-Za-z]:\\\\?Users\\\\?)'"$name"
-report "absolute home path" "$(printf '%s\n' "$out" | grep -v -E ':(/(Users|home)/|[A-Za-z]:\\\\?Users\\\\?)alice$')"
-
-grep_index -E '(~|[$]HOME|[$][{]HOME[}])/[.]claude'
-report "path into the home .claude folder" "$out"
+home_re='(/(Users|home)/|[A-Za-z]:\\\\?Users\\\\?)'"$name"
+alice_re=':(/(Users|home)/|[A-Za-z]:\\\\?Users\\\\?)alice$'
+claude_re='(~|[$]HOME|[$][{]HOME[}])/[.]claude'
 
 # An ID, after the start of a line or a character that is not a letter or digit, so `_` separates
 # words.  Matched with LC_ALL=C, byte for byte, so a letter that is not ASCII separates words too,
@@ -242,25 +261,12 @@ below_floor() {
     done <<<"$1"
 }
 
-LC_ALL=C grep_index -a -o -E "$id_re"
-report "bug or plan ID citation" "$(below_floor "$out")"
-
-# grep -n numbers the matches by path, so each is reported with its path.
-LC_ALL=C grep_paths -n -o -E "$id_re"
-path_list=()
-while IFS= read -r line; do path_list+=("$line"); done <<<"$paths"
-hits=""
-while IFS=: read -r n match; do
-    [ -n "$n" ] && hits+="${path_list[n - 1]}:$match"$'\n'
-done <<<"$out"
-report "bug or plan ID in a path" "$(below_floor "$hits")"
-
-# Only a proven "no such file" (ENOENT) is absence; anything else this lstat cannot answer is a
-# list the gate could not read.  Bash cannot see errno, so perl looks.
-patterns=""
-if [ "$generic_only" -eq 1 ]; then
-    echo "leak-gate: --generic-only: scanned the generic layer only" >&2
-else
+# The private list, as one whole-word pattern per name in $words, or $words empty.  What an empty
+# list means is said after the scan.  Only a proven "no such file" (ENOENT) is absence; anything
+# else this lstat cannot answer is a list the gate could not read.  Bash cannot see errno, so perl
+# looks.
+patterns="" words="" word_args=()
+if [ "$generic_only" -eq 0 ]; then
     perl -e 'exit(lstat($ARGV[0]) ? 0 : $!{ENOENT} ? 1 : 2)' -- "$list"
     case $? in
         0) [ -r "$list" ] || { echo "leak-gate: cannot read the private list $list" >&2; exit 1; }
@@ -274,17 +280,172 @@ else
         # `-w` would count `_` as part of the word.
         words=$(printf '%s\n' "$patterns" | sed 's/.*/(^|[^[:alnum:]])(&)([^[:alnum:]]|$)/') ||
             { echo "leak-gate: sed failed over the private list" >&2; exit 1; }
-        grep_index -i -E -f <(printf '%s\n' "$words")
+        # As arguments, not a pipe: each search reads them twice (grep_index).
+        while IFS= read -r line; do word_args+=(-e "$line"); done <<<"$words"
+    fi
+fi
+
+# Sets $out to git grep's matches over the scope.  git grep exits 1 for "no match" and above 1
+# when it failed, which must never read as clean.  Each search runs twice, in the caller's locale and
+# byte for byte (LC_ALL=C), and the matches are joined: in a UTF-8 locale a line holding a byte that
+# is not UTF-8 matches nothing, in git grep and in macOS's grep, while in C `-i` folds only ASCII.
+grep_index() {
+    local a b status
+    a=$(git grep --cached --no-color -n "$@" "${scope[@]}")
+    status=$?
+    [ "$status" -le 1 ] || { echo "leak-gate: git grep failed (exit $status)" >&2; exit 1; }
+    b=$(LC_ALL=C git grep --cached --no-color -n "$@" "${scope[@]}")
+    status=$?
+    [ "$status" -le 1 ] || { echo "leak-gate: git grep failed (exit $status)" >&2; exit 1; }
+    join_matches "$a" "$b"
+}
+
+scan_index() {
+    local line n match hits path_list
+    scope=(-- .)
+    read_tracked .leak-gate-exclude
+    significant
+    if [ -n "$lines" ]; then
+        while IFS= read -r line; do
+            scope+=(":(exclude,literal)$line")
+        done <<<"$lines"
+        echo "leak-gate: not scanning what .leak-gate-exclude lists: $(tr '\n' ' ' <<<"$lines")" >&2
+    fi
+
+    # A tracked file's path is published too.  Unquoted, so a name that is not ASCII stays itself.
+    paths=$(git -c core.quotePath=false ls-files --cached "${scope[@]}") || { echo "leak-gate: git ls-files failed" >&2; exit 1; }
+    if [ -z "$paths" ]; then
+        all=$(git ls-files --cached) || { echo "leak-gate: git ls-files failed" >&2; exit 1; }
+        [ -z "$all" ] || { echo "leak-gate: .leak-gate-exclude leaves nothing to scan" >&2; exit 1; }
+    fi
+
+    grep_index -o -E "$home_re"
+    report "absolute home path" "$(printf '%s\n' "$out" | grep -v -E "$alice_re")"
+
+    grep_index -E "$claude_re"
+    report "path into the home .claude folder" "$out"
+
+    LC_ALL=C grep_index -a -o -E "$id_re"
+    report "bug or plan ID citation" "$(below_floor "$out")"
+
+    # grep -n numbers the matches by path, so each is reported with its path.
+    LC_ALL=C grep_text "$paths" -a -n -o -E "$id_re"
+    path_list=()
+    while IFS= read -r line; do path_list+=("$line"); done <<<"$paths"
+    hits=""
+    while IFS=: read -r n match; do
+        [ -n "$n" ] && hits+="${path_list[n - 1]}:$match"$'\n'
+    done <<<"$out"
+    report "bug or plan ID in a path" "$(below_floor "$hits")"
+
+    if [ -n "$words" ]; then
+        grep_index -i -E "${word_args[@]}"
         report "private name" "$out"
-        grep_paths -i -E -f <(printf '%s\n' "$words")
+        grep_text "$paths" -a -i -E "${word_args[@]}"
         report "private name in a path" "$out"
-    elif [ "$named" -eq 1 ]; then
+    fi
+}
+
+# Prints each line of $2 after `$1:`.
+label() {
+    local line
+    while IFS= read -r line; do
+        [ -z "$line" ] || printf '%s:%s\n' "$1" "$line"
+    done <<<"$2"
+}
+
+# Scans the text $2, a message, with both layers, reporting each finding as `$1:<line>:...`.  Every
+# grep takes the text as text (-a): GNU grep would otherwise print nothing for a line holding a byte
+# that is not UTF-8, and exit 0.
+scan_text() {
+    local where=$1 text=$2
+    grep_text "$text" -a -n -o -E "$home_re"
+    report "absolute home path" "$(label "$where" "$(printf '%s\n' "$out" | grep -a -v -E "$alice_re")")"
+
+    grep_text "$text" -a -n -E "$claude_re"
+    report "path into the home .claude folder" "$(label "$where" "$out")"
+
+    LC_ALL=C grep_text "$text" -a -n -o -E "$id_re"
+    report "bug or plan ID citation" "$(label "$where" "$(below_floor "$out")")"
+
+    if [ -n "$words" ]; then
+        grep_text "$text" -a -n -i -E "${word_args[@]}"
+        report "private name" "$(label "$where" "$out")"
+    fi
+}
+
+# Scans every line of the message file $target, in the header's terms.  bash would drop a NUL from
+# the text, and join the words on either side of it, so a NUL becomes a line break first.
+scan_message() {
+    local text
+    text=$(cat -- "$target" | LC_ALL=C tr '\0' '\n') || { echo "leak-gate: cannot read the message $target" >&2; exit 1; }
+    scan_text message "$text"
+}
+
+# The message of the commit or tag object $1, raw, as a push sends it: replace refs ignored, the
+# headers dropped, and a NUL read as a line break, as in scan_message.  tr and sed work on bytes
+# (LC_ALL=C), since a message need not be valid UTF-8.
+object_message() {
+    git --no-replace-objects cat-file "$2" "$1" | LC_ALL=C tr '\0' '\n' | LC_ALL=C sed '1,/^$/d'
+}
+
+# Scans the messages of the commits in $target, and of the annotated tags that point to them.
+scan_range() {
+    local shallow commits c text tags type object ref o t chain status
+    shallow=$(git rev-parse --is-shallow-repository) || { echo "leak-gate: git rev-parse failed" >&2; exit 1; }
+    if [ "$shallow" != false ]; then
+        echo "leak-gate: this is a shallow clone, whose history stops early; fetch all of it (in CI, actions/checkout with fetch-depth: 0)" >&2
+        exit 4
+    fi
+    commits=$(git --no-replace-objects rev-list "$target" --) || { echo "leak-gate: git cannot list $target" >&2; exit 1; }
+    [ -n "$commits" ] || echo "leak-gate: $target holds no commits" >&2
+    for c in $commits; do
+        text=$(object_message "$c" commit) || { echo "leak-gate: cannot read commit $c" >&2; exit 1; }
+        scan_text "commit ${c:0:12}" "$text"
+    done
+    tags=$(git --no-replace-objects for-each-ref --format='%(objecttype) %(objectname) %(refname)' refs/tags) ||
+        { echo "leak-gate: git for-each-ref failed" >&2; exit 1; }
+    while read -r type object ref; do
+        [ "$type" = tag ] || continue
+        # A tag of a tag publishes both messages, so the chain is walked to the object it ends at.
+        # Each tag object's first header line names the object it points to.
+        chain="" o=$object
+        while :; do
+            t=$(git --no-replace-objects cat-file -t "$o") || { echo "leak-gate: cannot read an object of tag $ref" >&2; exit 1; }
+            [ "$t" = tag ] || break
+            chain+=" $o"
+            o=$(git --no-replace-objects cat-file tag "$o" | LC_ALL=C sed -n '1s/^object //p') ||
+                { echo "leak-gate: cannot read an object of tag $ref" >&2; exit 1; }
+            [ -n "$o" ] || { echo "leak-gate: tag $ref does not name the object it points to" >&2; exit 1; }
+        done
+        # A tag of a tree or a blob points to no commit, so to none in the range.
+        [ "$t" = commit ] || continue
+        grep -q -x -F -e "$o" <<<"$commits"
+        status=$?
+        [ "$status" -le 1 ] || { echo "leak-gate: grep failed (exit $status)" >&2; exit 1; }
+        [ "$status" -eq 0 ] || continue
+        for o in $chain; do
+            text=$(object_message "$o" tag) || { echo "leak-gate: cannot read tag $ref" >&2; exit 1; }
+            scan_text "tag ${ref#refs/tags/}" "$text"
+        done
+    done <<<"$tags"
+}
+
+case $command in
+    index) scan_index ;;
+    message) scan_message ;;
+    range) scan_range ;;
+esac
+
+if [ "$generic_only" -eq 1 ]; then
+    echo "leak-gate: --generic-only: scanned the generic layer only" >&2
+elif [ -z "$words" ]; then
+    if [ "$named" -eq 1 ]; then
         echo "leak-gate: .leak-gate.toml names the private list $list_key, and ~/.config/leak-gate/lists/$list_key.txt does not exist or holds no pattern; create it, or pass --generic-only where no list can be" >&2
         exit 4
-    else
-        echo "leak-gate: no private patterns at $list; scanned the generic layer only" >&2
-        [ "$require_private" -eq 0 ] || exit 4
     fi
+    echo "leak-gate: no private patterns at $list; scanned the generic layer only" >&2
+    [ "$require_private" -eq 0 ] || exit 4
 fi
 
 if [ "$found" -eq 1 ]; then

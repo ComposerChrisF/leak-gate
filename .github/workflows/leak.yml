@@ -1,0 +1,50 @@
+name: Leak gate
+
+# Every push and pull request, on every branch.  No concurrency group, and so no run cancelled for a
+# newer push: the messages step reads only what each event adds, so a push whose run never
+# completed would have its messages read by no run at all.
+on: [push, pull_request]
+
+jobs:
+  # The gate, run on this repository by its own copy: the files, then the messages this event adds.
+  # The whole history is fetched, since `range` refuses a shallow clone.
+  leak:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+      - run: scripts/leak-gate --generic-only
+      # Run even when the files failed, or this push's messages would never be read.
+      - name: commit and tag messages
+        if: ${{ !cancelled() }}
+        env:
+          EVENT: ${{ github.event_name }}
+          REF: ${{ github.ref }}
+          BEFORE: ${{ github.event.before }}
+          AFTER: ${{ github.event.after }}
+          DEFAULT: ${{ github.event.repository.default_branch }}
+          PR_BASE: ${{ github.event.pull_request.base.sha }}
+          PR_HEAD: ${{ github.event.pull_request.head.sha }}
+        run: |
+          zero=0000000000000000000000000000000000000000
+          if [ "$EVENT" = pull_request ]; then
+            scripts/leak-gate --generic-only range "$PR_BASE..$PR_HEAD"
+          elif [ "$AFTER" = "$zero" ]; then
+            echo "a deleted ref publishes no message"
+          else
+            case $REF in
+              # The tag's own message, then any commits it brings that the default branch lacks.
+              refs/tags/*)
+                scripts/leak-gate --generic-only range "$REF^!" &&
+                  scripts/leak-gate --generic-only range "origin/$DEFAULT..$REF" ;;
+              *)
+                if [ "$BEFORE" != "$zero" ] && git cat-file -e "$BEFORE^{commit}" 2>/dev/null; then
+                  scripts/leak-gate --generic-only range "$BEFORE..$AFTER"
+                elif [ "$REF" = "refs/heads/$DEFAULT" ]; then
+                  scripts/leak-gate --generic-only range "$AFTER"
+                else
+                  scripts/leak-gate --generic-only range "origin/$DEFAULT..$AFTER"
+                fi ;;
+            esac
+          fi

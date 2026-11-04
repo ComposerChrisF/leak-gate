@@ -12,13 +12,6 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  # The gate, run on this repository by its own copy.
-  leak:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v6
-      - run: scripts/leak-gate --generic-only
-
   # The tests are Unix-only, as the script is.
   test:
     strategy:
