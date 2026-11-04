@@ -1264,11 +1264,42 @@ fn a_list_setting_not_in_its_form_is_exit_1() {
         "allow-under = [\"a/./b\"]\n",
         "allow-under = [\"\"]\n",
         "allow-under = [\"a\\tb\"]\n",
+        "allow-under = [\"a\tb\"]\n",
         "allow-under = [\"a\"]\nallow-under = [\"b\"]\n",
+        "allow-under = [\"tests/fixtures\"]\n",
     ];
     for text in texts {
         let fx = Fixture::new(&[(".leak-gate.toml", text.as_bytes()), ("a.txt", b"clean\n")]);
         let out = fx.gate_in(&fx.repo(), None, &["--generic-only"]);
         assert_eq!(out.status.code(), Some(1), "{text:?}: {}", show(&out));
     }
+}
+
+/// git quotes a name holding `"`, `\`, or a control character whatever `core.quotePath` says, so
+/// the file-type rule reads the names as git stores them; and each refused file is one finding.
+#[test]
+fn refuse_extensions_reads_names_git_would_quote() {
+    let names = [
+        "Ave \"Verum\".sib",
+        "back\\slash.SIB",
+        "tab\there.sib",
+        "plain.sib",
+    ];
+    let mut files: Vec<(&str, &[u8])> =
+        vec![(".leak-gate.toml", b"refuse-extensions = [\"sib\"]\n")];
+    files.extend(names.iter().map(|n| (*n, &b"x\n"[..])));
+    files.push(("ok.txt", b"x\n"));
+    let fx = Fixture::new(&files);
+    let out = fx.gate_in(&fx.repo(), None, &["--generic-only"]);
+    assert_eq!(out.status.code(), Some(3), "{}", show(&out));
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let found: Vec<&str> = stdout.lines().collect();
+    let want: Vec<String> = names
+        .iter()
+        .map(|n| format!("leak: refused file type: {n}"))
+        .collect();
+    for line in &want {
+        assert!(found.contains(&line.as_str()), "{line:?} not in {found:#?}");
+    }
+    assert_eq!(found.len(), want.len(), "one finding per file: {found:#?}");
 }

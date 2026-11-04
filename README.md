@@ -54,7 +54,7 @@ refuse-extensions = ["sib", "musx"]
 allow-under = ["tests/fixtures"]
 ```
 
-Every tracked file whose name ends in `.sib` or `.musx`, ignoring case, is refused, except below `tests/fixtures/`.  The rule is in the generic layer, so CI refuses it too.  Only the name is read: a file of that kind under another name is not seen.
+Every tracked file whose name ends in `.sib` or `.musx`, ignoring case, is refused, except below `tests/fixtures/` and in a path `.leak-gate-exclude` lists.  The rule is in the generic layer, so CI refuses it too.  Only the name is read: a file of that kind under another name is not seen.
 
 ## Status
 

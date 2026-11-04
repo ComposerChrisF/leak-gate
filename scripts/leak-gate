@@ -30,21 +30,24 @@
 # is: a path, `message`, `commit <abbreviated sha>`, or `tag <name>`.
 #
 # Two layers, each over what is scanned:
-#   generic  Committed here, and run by CI and by the hooks: absolute home paths other than the
-#            test fixtures' `alice` (`/Users/<name>`, `/home/<name>`, `C:\Users\<name>`; the
-#            exception cannot apply to a binary file), paths into the home directory's `.claude`
-#            folder (`~`, `$HOME`, or `${HOME}`), paths from the home directory into a folder that
-#            is not a dot-folder (`~/<folder>`, `$HOME/<folder>`, `${HOME}/<folder>`, and Rust's
-#            `env!("HOME")` followed on the same line by `, "/<folder>`: a dot-folder such as
-#            `~/.config` names tool state, any other the owner's own files; the home directory
-#            reached another way, such as `std::env::var("HOME")`, is not seen), and bug or plan
-#            ID citations, in a file's
-#            contents or path or in a message, that a history cut from its predecessor's cannot
-#            resolve: an ID that is not four digits at or above its series' floor, or any ID of a
-#            series with no floor.  An ID counts wherever it does not follow a letter or digit, so
-#            `_` and a letter that is not ASCII separate it from what is before it.  A floor is
-#            `bugs/FLOOR` or `plans/FLOOR`, a tracked regular file whose one line that is not blank
-#            or a `#` comment names the series' lowest ID, above 0000.
+#   generic  Committed here, and run by CI and by the hooks.  It refuses:
+#              - an absolute home path other than the test fixtures' `alice` (`/Users/<name>`,
+#                `/home/<name>`, `C:\Users\<name>`; the exception cannot apply to a binary file);
+#              - a path into the home directory's `.claude` folder (`~`, `$HOME`, or `${HOME}`);
+#              - a path from the home directory into a folder that is not a dot-folder
+#                (`~/<folder>`, `$HOME/<folder>`, `${HOME}/<folder>`, and Rust's `env!("HOME")`
+#                followed on the same line by `, "/<folder>`): a dot-folder such as `~/.config`
+#                names tool state, any other the owner's own files.  The home directory reached
+#                another way, such as `std::env::var("HOME")`, is not seen;
+#              - a bug or plan ID citation, in a file's contents or path or in a message, that a
+#                history cut from its predecessor's cannot resolve: an ID that is not four digits
+#                at or above its series' floor, or any ID of a series with no floor.  An ID counts
+#                wherever it does not follow a letter or digit, so `_` and a letter that is not
+#                ASCII separate it from what is before it.  A floor is `bugs/FLOOR` or
+#                `plans/FLOOR`, a tracked regular file whose one line that is not blank or a `#`
+#                comment names the series' lowest ID, above 0000;
+#              - and, when `.leak-gate.toml` sets `refuse-extensions`, a tracked file of a refused
+#                kind (Settings, below).
 #   private  Names that must not be published, so never committed: one extended regular
 #            expression per line (a line starting with `#` is a comment, and a line's trailing
 #            carriage return is dropped, so a list saved with CRLF line endings still matches),
@@ -73,7 +76,7 @@
 #                                 that kind under another name is not seen.
 #   allow-under = ["<folder>"]    Except a file below one of these folders: each a path from the
 #                                 repository root, with no empty, `.`, or `..` part (a trailing `/`
-#                                 is dropped).
+#                                 is dropped).  It is set only beside `refuse-extensions`.
 # Any other key, a key set twice, a value of the wrong kind or not in its form, a line not in this
 # form, or a `.leak-gate.toml` that is not a regular file stops the gate: a setting it could not
 # read must never pass as no setting.
@@ -207,7 +210,9 @@ if [ "$tracked" -eq 1 ]; then
                 }
                 print "$key\t$v\n";
             }
-        }') || exit 1
+        }
+        $seen{"allow-under"} && !$seen{"refuse-extensions"}
+            and die "leak-gate: .leak-gate.toml sets allow-under without refuse-extensions, so it does nothing\n";') || exit 1
     while IFS=$'\t' read -r key value; do
         case $key in
             private-list) list_key=$value ;;
@@ -390,24 +395,22 @@ scan_index() {
     done <<<"$out"
     report "bug or plan ID in a path" "$(below_floor "$hits")"
 
-    # A refused kind of file, by the end of its name, outside the folders allowed it.
+    # A refused kind of file, by the end of its name, outside the folders allowed it.  The names are
+    # read as git stores them (-z): git quotes a name holding `"`, `\`, or a control character
+    # whatever core.quotePath says, and a quoted name no longer ends in its extension.
     if [ -n "$refuse_exts" ]; then
-        local ext_re="" e d p allowed
-        while IFS= read -r e; do
-            [ -n "$e" ] && ext_re+="${ext_re:+|}${e//./\\.}"
-        done <<<"$refuse_exts"
-        grep_text "$paths" -a -i -E "\\.($ext_re)\$"
-        hits=""
-        while IFS= read -r p; do
-            [ -n "$p" ] || continue
-            allowed=0
-            while IFS= read -r d; do
-                [ -n "$d" ] || continue
-                case $p in "$d"/*) allowed=1; break ;; esac
-            done <<<"$allow_dirs"
-            [ "$allowed" -eq 1 ] || hits+="$p"$'\n'
-        done <<<"$out"
-        report "refused file type" "$hits"
+        out=$(git ls-files -z --cached "${scope[@]}" | EXTS=$refuse_exts DIRS=$allow_dirs perl -0 -ne '
+            BEGIN {
+                @ext = grep { length } split /\n/, $ENV{EXTS};
+                @dir = grep { length } split /\n/, $ENV{DIRS};
+            }
+            chomp;
+            my $name = $_;
+            next unless grep { $name =~ /\.\Q$_\E\z/i } @ext;
+            next if grep { index($name, "$_/") == 0 } @dir;
+            print "$name\n";
+        ') || { echo "leak-gate: cannot list the tracked files" >&2; exit 1; }
+        report "refused file type" "$out"
     fi
 
     if [ -n "$words" ]; then
