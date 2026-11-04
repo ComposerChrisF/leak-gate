@@ -60,10 +60,21 @@
 #            --generic-only skips the layer, whatever names a list.
 #
 # Settings: a tracked `.leak-gate.toml` at the repository root, read from the index.  It is a
-# small part of TOML: one `key = "value"` per line, the value holding no `"`, `\`, or `#`, with
-# blank lines and `#` comments.  The one key is `private-list`, whose value is a list's key:
-# letters, digits, `.`, `_`, and `-`, starting with a letter or digit.  The key is published with
-# the file, so it must not itself be private.  Any other key, a key set twice, a line not in this
+# small part of TOML: one `key = value` per line, a value being a string in double quotes or a list
+# of them in `[ ]` on the same line, each holding no `"`, `\`, `#`, or control character, with
+# blank lines and `#` comments.  The keys:
+#   private-list = "<key>"        The private list, above.  A list's key is letters, digits, `.`,
+#                                 `_`, and `-`, starting with a letter or digit.  It is published
+#                                 with the file, so it must not itself be private.
+#   refuse-extensions = ["<ext>"] Refuse every tracked file whose name ends in `.<ext>`, ignoring
+#                                 case, in the generic layer, so CI refuses it too.  An extension is
+#                                 written without its first dot (`sib`, `tar.gz`), in the
+#                                 characters of a list's key.  Only the name is read: a file of
+#                                 that kind under another name is not seen.
+#   allow-under = ["<folder>"]    Except a file below one of these folders: each a path from the
+#                                 repository root, with no empty, `.`, or `..` part (a trailing `/`
+#                                 is dropped).
+# Any other key, a key set twice, a value of the wrong kind or not in its form, a line not in this
 # form, or a `.leak-gate.toml` that is not a regular file stops the gate: a setting it could not
 # read must never pass as no setting.
 #
@@ -152,7 +163,7 @@ significant() {
 
 # The repository's settings, in the header's form, or the gate stops.  The blob goes to perl as it
 # is: bash would drop a NUL from it, and could turn a corrupt file into an empty one.
-list_key=""
+list_key="" refuse_exts="" allow_dirs=""
 read_tracked .leak-gate.toml
 if [ "$tracked" -eq 1 ]; then
     case $mode in
@@ -160,21 +171,49 @@ if [ "$tracked" -eq 1 ]; then
         *) echo "leak-gate: .leak-gate.toml is not a regular file" >&2; exit 1 ;;
     esac
     settings=$(git show ":.leak-gate.toml" | perl -e '
+        my %kind = ("private-list" => "string", "refuse-extensions" => "list", "allow-under" => "list");
+        my $where = ".leak-gate.toml line";
         my ($n, %seen) = (0);
         while (my $line = <STDIN>) {
             $n++;
             chomp $line;
-            next if $line =~ /^\s*(?:#.*)?$/;
-            my ($key, $value) = $line =~ /^\s*([A-Za-z0-9_-]+)\s*=\s*"([^"\\#]*)"\s*(?:#.*)?$/
-                or die "leak-gate: .leak-gate.toml line $n is not in the form key = \"value\"\n";
-            $key eq "private-list" or die "leak-gate: .leak-gate.toml line $n: unknown key $key\n";
-            $seen{$key}++ and die "leak-gate: .leak-gate.toml line $n: $key is set twice\n";
-            $value =~ /^[A-Za-z0-9][A-Za-z0-9._-]*$/
-                or die "leak-gate: .leak-gate.toml line $n: a list key is letters, digits, ., _, and -, starting with a letter or digit\n";
-            print "$key\t$value\n";
+            # No value holds a "#", so the first one starts a comment.
+            (my $body = $line) =~ s/#.*//s;
+            next if $body =~ /^\s*$/;
+            my ($key, $raw) = $body =~ /^\s*([A-Za-z0-9_-]+)\s*=\s*(.*?)\s*$/
+                or die "leak-gate: $where $n is not in the form key = value\n";
+            exists $kind{$key} or die "leak-gate: $where $n: unknown key $key\n";
+            $seen{$key}++ and die "leak-gate: $where $n: $key is set twice\n";
+            my $item = qr/"[^"\\\x00-\x1f\x7f]*"/;
+            my @values;
+            if ($kind{$key} eq "string") {
+                $raw =~ /^$item$/ or die "leak-gate: $where $n: $key takes one string in double quotes\n";
+                @values = ($raw);
+            } else {
+                $raw =~ /^\[\s*(?:$item\s*(?:,\s*$item\s*)*,?\s*)?\]$/
+                    or die "leak-gate: $where $n: $key takes a list of strings in [ ], on one line\n";
+                @values = $raw =~ /($item)/g;
+            }
+            for my $v (@values) {
+                $v = substr($v, 1, -1);
+                if ($key eq "allow-under") {
+                    $v =~ s{/+$}{};
+                    my @parts = split m{/}, $v, -1;
+                    ($v ne "" && !grep { $_ eq "" || $_ eq "." || $_ eq ".." } @parts)
+                        or die "leak-gate: $where $n: a folder is a path from the repository root, with no empty, ., or .. part\n";
+                } else {
+                    $v =~ /^[A-Za-z0-9][A-Za-z0-9._-]*$/
+                        or die "leak-gate: $where $n: $key takes letters, digits, ., _, and -, starting with a letter or digit\n";
+                }
+                print "$key\t$v\n";
+            }
         }') || exit 1
     while IFS=$'\t' read -r key value; do
-        case $key in private-list) list_key=$value ;; esac
+        case $key in
+            private-list) list_key=$value ;;
+            refuse-extensions) refuse_exts+="$value"$'\n' ;;
+            allow-under) allow_dirs+="$value"$'\n' ;;
+        esac
     done <<<"$settings"
 fi
 
@@ -350,6 +389,26 @@ scan_index() {
         [ -n "$n" ] && hits+="${path_list[n - 1]}:$match"$'\n'
     done <<<"$out"
     report "bug or plan ID in a path" "$(below_floor "$hits")"
+
+    # A refused kind of file, by the end of its name, outside the folders allowed it.
+    if [ -n "$refuse_exts" ]; then
+        local ext_re="" e d p allowed
+        while IFS= read -r e; do
+            [ -n "$e" ] && ext_re+="${ext_re:+|}${e//./\\.}"
+        done <<<"$refuse_exts"
+        grep_text "$paths" -a -i -E "\\.($ext_re)\$"
+        hits=""
+        while IFS= read -r p; do
+            [ -n "$p" ] || continue
+            allowed=0
+            while IFS= read -r d; do
+                [ -n "$d" ] || continue
+                case $p in "$d"/*) allowed=1; break ;; esac
+            done <<<"$allow_dirs"
+            [ "$allowed" -eq 1 ] || hits+="$p"$'\n'
+        done <<<"$out"
+        report "refused file type" "$hits"
+    fi
 
     if [ -n "$words" ]; then
         grep_index -i -E "${word_args[@]}"

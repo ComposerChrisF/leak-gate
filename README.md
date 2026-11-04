@@ -4,9 +4,10 @@ A pre-commit and CI check that refuses to publish a private reference.  It scans
 
 - an absolute home path (`/Users/<name>`, `/home/<name>`, `C:\Users\<name>`), a path into the home directory’s `.claude` folder, or a path from the home directory into a folder that is not a dot-folder (`~/<folder>`, `$HOME/<folder>`, or in Rust `env!("HOME")` followed by `"/<folder>`), since a dot-folder such as `~/.config` names tool state and any other folder the owner’s own files;
 - a bug or plan ID that the repository’s history cannot resolve: one below its series’ floor (`bugs/FLOOR`, `plans/FLOOR`), or any ID of a series with no floor;
-- a name on a private list, which is never committed.
+- a name on a private list, which is never committed;
+- a tracked file of a kind the repository refuses, by the end of its name, outside the folders it allows.
 
-The first two are the **generic** layer, which runs anywhere, CI included.  The third is the **private** layer, which runs only where the list is.
+The first two and the last are the **generic** layer, which runs anywhere, CI included.  The third is the **private** layer, which runs only where the list is.
 
 `scripts/leak-gate --help` is the contract: what is scanned, what is excluded, and the exit codes.
 
@@ -44,9 +45,20 @@ private-list = "myproject"
 
 The gate then reads `~/.config/leak-gate/lists/myproject.txt`, one extended regular expression per line, matched as whole words, ignoring case.  The key is committed and the list never is, so every clone on the same machine finds the same list, and each repository is checked against its own names rather than another’s.  A list the repository names must exist and hold a pattern, or the gate stops with exit 4; CI, which has no list, runs `leak-gate --generic-only`.  `$LEAK_GATE_PATTERNS` overrides the named list, and a repository that names none, with no `.leak-gate.toml` or with one that sets no `private-list`, uses `~/.config/leak-gate/patterns.txt` when it is there.
 
+## A repository’s refused kinds of file
+
+A repository that must not publish some kind of file, such as music scores beside its own test fixtures, says so in `.leak-gate.toml`:
+
+```toml
+refuse-extensions = ["sib", "musx"]
+allow-under = ["tests/fixtures"]
+```
+
+Every tracked file whose name ends in `.sib` or `.musx`, ignoring case, is refused, except below `tests/fixtures/`.  The rule is in the generic layer, so CI refuses it too.  Only the name is read: a file of that kind under another name is not seen.
+
 ## Status
 
-The script and its tests moved here from `cli-contract`, where the gate began.  Each repository now names its own private list; the gate reads commit and annotated tag messages as well as files; and it refuses a path from the home directory into the owner’s own folders.  Still to come: a per-repository rule that refuses given file types outside a cleared folder.
+The script and its tests moved here from `cli-contract`, where the gate began.  Each repository now names its own private list; the gate reads commit and annotated tag messages as well as files; it refuses a path from the home directory into the owner’s own folders; and each repository can refuse kinds of file outside the folders it clears.
 
 ## Tests
 

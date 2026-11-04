@@ -1183,3 +1183,92 @@ fn generic_layer_refuses_a_path_from_the_home_directory() {
         }
     }
 }
+
+/// `refuse-extensions` refuses a tracked file by the end of its name, ignoring case, in the
+/// generic layer and so in CI, except below a folder `allow-under` names.
+#[test]
+fn refuse_extensions_outside_allow_under() {
+    let settings = "refuse-extensions = [\"sib\", \"tar.gz\"]  # scores\nallow-under = [\"tests/fixtures/\"]\n";
+    let files: [(&str, bool); 10] = [
+        ("scores/a.sib", true),
+        ("scores/B.SIB", true),
+        ("x.tar.gz", true),
+        ("tests/fixturesX/y.sib", true),
+        ("tests/fixtures/z.sib", false),
+        ("tests/fixtures/deep/w.sib", false),
+        ("notes.txt", false),
+        ("sib.txt", false),
+        ("x.sibx", false),
+        ("x.tarXgz", false),
+    ];
+    for (path, refused) in files {
+        let fx = Fixture::new(&[(".leak-gate.toml", settings.as_bytes()), (path, b"clean\n")]);
+        for args in [&[][..], &["--generic-only"][..]] {
+            let out = fx.gate_in(&fx.repo(), None, args);
+            let want = if refused { Some(3) } else { Some(0) };
+            assert_eq!(
+                out.status.code(),
+                want,
+                "{path:?}, {args:?}: {}",
+                show(&out)
+            );
+            if refused {
+                assert!(
+                    String::from_utf8_lossy(&out.stdout)
+                        .contains(&format!("refused file type: {path}")),
+                    "{}",
+                    show(&out)
+                );
+            }
+        }
+    }
+
+    // A file the repository never publishes is not scanned, by this rule either.
+    let fx = Fixture::new(&[
+        (".leak-gate.toml", b"refuse-extensions = [\"sib\"]\n"),
+        (".leak-gate-exclude", b"private/\n"),
+        ("private/a.sib", b"clean\n"),
+        ("README.md", b"clean\n"),
+    ]);
+    let out = fx.gate_in(&fx.repo(), None, &["--generic-only"]);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "an excluded file: {}",
+        show(&out)
+    );
+
+    // An empty list refuses nothing.
+    let fx = Fixture::new(&[
+        (".leak-gate.toml", b"refuse-extensions = []\n"),
+        ("a.sib", b"x\n"),
+    ]);
+    let out = fx.gate_in(&fx.repo(), None, &["--generic-only"]);
+    assert_eq!(out.status.code(), Some(0), "an empty list: {}", show(&out));
+}
+
+/// A list setting not in its form stops the gate, as any other setting does.
+#[test]
+fn a_list_setting_not_in_its_form_is_exit_1() {
+    let texts = [
+        "refuse-extensions = \"sib\"\n",
+        "refuse-extensions = [\".sib\"]\n",
+        "refuse-extensions = [\"sib\"\n",
+        "refuse-extensions = [\"sib\" \"musx\"]\n",
+        "refuse-extensions = [sib]\n",
+        "refuse-extensions = [\"si b\"]\n",
+        "private-list = [\"proj\"]\n",
+        "allow-under = [\"/abs\"]\n",
+        "allow-under = [\"../up\"]\n",
+        "allow-under = [\"a//b\"]\n",
+        "allow-under = [\"a/./b\"]\n",
+        "allow-under = [\"\"]\n",
+        "allow-under = [\"a\\tb\"]\n",
+        "allow-under = [\"a\"]\nallow-under = [\"b\"]\n",
+    ];
+    for text in texts {
+        let fx = Fixture::new(&[(".leak-gate.toml", text.as_bytes()), ("a.txt", b"clean\n")]);
+        let out = fx.gate_in(&fx.repo(), None, &["--generic-only"]);
+        assert_eq!(out.status.code(), Some(1), "{text:?}: {}", show(&out));
+    }
+}
