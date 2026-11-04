@@ -33,7 +33,12 @@
 #   generic  Committed here, and run by CI and by the hooks: absolute home paths other than the
 #            test fixtures' `alice` (`/Users/<name>`, `/home/<name>`, `C:\Users\<name>`; the
 #            exception cannot apply to a binary file), paths into the home directory's `.claude`
-#            folder (`~`, `$HOME`, or `${HOME}`), and bug or plan ID citations, in a file's
+#            folder (`~`, `$HOME`, or `${HOME}`), paths from the home directory into a folder that
+#            is not a dot-folder (`~/<folder>`, `$HOME/<folder>`, `${HOME}/<folder>`, and Rust's
+#            `env!("HOME")` followed on the same line by `, "/<folder>`: a dot-folder such as
+#            `~/.config` names tool state, any other the owner's own files; the home directory
+#            reached another way, such as `std::env::var("HOME")`, is not seen), and bug or plan
+#            ID citations, in a file's
 #            contents or path or in a message, that a history cut from its predecessor's cannot
 #            resolve: an ID that is not four digits at or above its series' floor, or any ID of a
 #            series with no floor.  An ID counts wherever it does not follow a letter or digit, so
@@ -240,6 +245,11 @@ home_re='(/(Users|home)/|[A-Za-z]:\\\\?Users\\\\?)'"$name"
 alice_re=':(/(Users|home)/|[A-Za-z]:\\\\?Users\\\\?)alice$'
 claude_re='(~|[$]HOME|[$][{]HOME[}])/[.]claude'
 
+# A folder's first character, as a user name's above but never a `.`, which starts a dot-folder.
+folder="[^].[:space:]/\\\\<>\"'\`(){}|*?:,;[]"
+home_folder_re='(~|[$]HOME|[$][{]HOME[}])/'"$folder"
+env_home_re='env![[:space:]]*\([[:space:]]*"HOME"[[:space:]]*\)[[:space:]]*,[[:space:]]*"/'"$folder"
+
 # An ID, after the start of a line or a character that is not a letter or digit, so `_` separates
 # words.  Matched with LC_ALL=C, byte for byte, so a letter that is not ASCII separates words too,
 # and with -o, so each match ends in the ID it found, binary files included.
@@ -325,6 +335,9 @@ scan_index() {
     grep_index -E "$claude_re"
     report "path into the home .claude folder" "$out"
 
+    grep_index -o -E -e "$home_folder_re" -e "$env_home_re"
+    report "path from the home directory" "$out"
+
     LC_ALL=C grep_index -a -o -E "$id_re"
     report "bug or plan ID citation" "$(below_floor "$out")"
 
@@ -364,6 +377,9 @@ scan_text() {
 
     grep_text "$text" -a -n -E "$claude_re"
     report "path into the home .claude folder" "$(label "$where" "$out")"
+
+    grep_text "$text" -a -n -o -E -e "$home_folder_re" -e "$env_home_re"
+    report "path from the home directory" "$(label "$where" "$out")"
 
     LC_ALL=C grep_text "$text" -a -n -o -E "$id_re"
     report "bug or plan ID citation" "$(label "$where" "$(below_floor "$out")")"

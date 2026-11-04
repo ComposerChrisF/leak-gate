@@ -1140,3 +1140,46 @@ fn the_index_scan_reads_a_line_that_is_not_utf8() {
         }
     }
 }
+
+/// A path from the home directory into a folder that is not a dot-folder names the owner's own
+/// files, in a file or in a message; a dot-folder names tool state and passes, and so does a
+/// placeholder such as `~/<folder>`.
+#[test]
+fn generic_layer_refuses_a_path_from_the_home_directory() {
+    let refused = [
+        ["~", "Projects", "x"].join("/"),
+        ["$HOME", "Projects"].join("/"),
+        ["${HOME}", "Projects", "x"].join("/"),
+        format!("concat!(env!({}), {})", "\"HOME\"", "\"/Projects/x\""),
+    ];
+    let passed = [
+        ["~", ".config", "leak-gate"].join("/"),
+        ["$HOME", ".cargo", "bin"].join("/"),
+        format!("concat!(env!({}), {})", "\"HOME\"", "\"/.cargo/bin\""),
+        "~/<folder>/x".to_string(),
+        "the home directory, ~/, alone".to_string(),
+        "about ~ 3 seconds".to_string(),
+    ];
+    for (texts, want) in [(&refused[..], Some(3)), (&passed[..], Some(0))] {
+        for text in texts.iter() {
+            let line = format!("see {text}\n");
+            let out = Fixture::new(&[("README.md", line.as_bytes())]).generic_gate();
+            assert_eq!(out.status.code(), want, "a file, {text:?}: {}", show(&out));
+
+            let fx = Fixture::new(&[("a.txt", b"clean\n")]);
+            let msg = fx.tmp.path().join("msg");
+            fs::write(&msg, &line).unwrap();
+            let out = fx.gate_in(
+                &fx.repo(),
+                None,
+                &["--generic-only", "message", msg.to_str().unwrap()],
+            );
+            assert_eq!(
+                out.status.code(),
+                want,
+                "a message, {text:?}: {}",
+                show(&out)
+            );
+        }
+    }
+}

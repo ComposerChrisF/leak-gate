@@ -2,7 +2,7 @@
 
 A pre-commit and CI check that refuses to publish a private reference.  It scans the index of a git repository (what is committed, or about to be), a commit message, or the commit and annotated tag messages in a range, and exits 3 when a tracked file’s contents or path, or a message, holds:
 
-- an absolute home path (`/Users/<name>`, `/home/<name>`, `C:\Users\<name>`), or a path into the home directory’s `.claude` folder;
+- an absolute home path (`/Users/<name>`, `/home/<name>`, `C:\Users\<name>`), a path into the home directory’s `.claude` folder, or a path from the home directory into a folder that is not a dot-folder (`~/<folder>`, `$HOME/<folder>`, or in Rust `env!("HOME")` followed by `"/<folder>`), since a dot-folder such as `~/.config` names tool state and any other folder the owner’s own files;
 - a bug or plan ID that the repository’s history cannot resolve: one below its series’ floor (`bugs/FLOOR`, `plans/FLOOR`), or any ID of a series with no floor;
 - a name on a private list, which is never committed.
 
@@ -46,7 +46,7 @@ The gate then reads `~/.config/leak-gate/lists/myproject.txt`, one extended regu
 
 ## Status
 
-The script and its tests moved here from `cli-contract`, where the gate began.  Each repository now names its own private list, and the gate reads commit and annotated tag messages as well as files.  Still to come: a generic rule for paths relative to the home directory; and a per-repository rule that refuses given file types outside a cleared folder.
+The script and its tests moved here from `cli-contract`, where the gate began.  Each repository now names its own private list; the gate reads commit and annotated tag messages as well as files; and it refuses a path from the home directory into the owner’s own folders.  Still to come: a per-repository rule that refuses given file types outside a cleared folder.
 
 ## Tests
 
