@@ -2,7 +2,7 @@
 
 A pre-commit and CI check that refuses to publish a private reference.  It scans the index of a git repository (what is committed, or about to be), a commit message, or the commit and annotated tag messages in a range, and exits 3 when a tracked file’s contents or path, or a message, holds:
 
-- an absolute home path (`/Users/<name>`, `/home/<name>`, `C:\Users\<name>`), a path into the home directory’s `.claude` folder, or a path from the home directory into a folder that is not a dot-folder (`~/<folder>`, `$HOME/<folder>`, or in Rust `env!("HOME")` followed by `"/<folder>`), since a dot-folder such as `~/.config` names tool state and any other folder the owner’s own files;
+- an absolute home path (`/Users/<name>`, `/home/<name>`, `C:\Users\<name>`), in a file’s contents or a message only, since a tracked path is relative; a path into the home directory’s `.claude` folder; a path from the home directory (`~/<folder>`, `$HOME/<folder>`, `${HOME}/<folder>`, or in Rust `env!("HOME")` followed on the same line by `"/<folder>`) into a folder of the owner’s own, which is any folder but a dot-folder such as `~/.config`, naming tool state, and the standard folders of a home, such as `~/Documents` or `~/Library`, naming the same place for every reader; or an address in the owner’s task roster that spells a path (`row:<folder>/<id>`; a short address is written without `row:`);
 - a bug or plan ID that the repository’s history cannot resolve: one below its series’ floor (`bugs/FLOOR`, `plans/FLOOR`), or any ID of a series with no floor;
 - a name on a private list, which is never committed;
 - a tracked file of a kind the repository refuses, by the end of its name, outside the folders it allows.
@@ -58,7 +58,7 @@ Every tracked file whose name ends in `.sib` or `.musx`, ignoring case, is refus
 
 ## Status
 
-The script and its tests moved here from `cli-contract`, where the gate began.  Each repository now names its own private list; the gate reads commit and annotated tag messages as well as files; it refuses a path from the home directory into the owner’s own folders; and each repository can refuse kinds of file outside the folders it clears.
+The script and its tests moved here from `cli-contract`, where the gate began.  Each repository now names its own private list; the gate reads commit and annotated tag messages as well as files; it refuses a path from the home directory into the owner’s own folders, and a roster address that spells a path; and each repository can refuse kinds of file outside the folders it clears.
 
 ## Tests
 

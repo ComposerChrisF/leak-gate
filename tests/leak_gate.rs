@@ -295,6 +295,10 @@ fn generic_layer_refuses_the_windows_and_home_variable_spellings() {
         ["C:", "", "Users", "", "bob"].join("\\"),
         ["$HOME", ".claude", "rules"].join("/"),
         ["${HOME}", ".claude", "rules"].join("/"),
+        // With a quote on either side of the `/`, which only this rule refuses, since the home
+        // directory rule lets a dot-folder pass.
+        ["\"$HOME\"", ".claude", "rules"].join("/"),
+        ["~", "'.claude'", "rules"].join("/"),
     ];
     let mut passed = Vec::new();
     for text in cases {
@@ -1141,9 +1145,33 @@ fn the_index_scan_reads_a_line_that_is_not_utf8() {
     }
 }
 
-/// A path from the home directory into a folder that is not a dot-folder names the owner's own
-/// files, in a file or in a message; a dot-folder names tool state and passes, and so does a
-/// placeholder such as `~/<folder>`.
+/// Asserts that the generic layer exits `want` over `text`, both in a tracked file and in a commit
+/// message.
+fn assert_in_a_file_and_a_message(text: &str, want: Option<i32>) {
+    let line = format!("see {text}\n");
+    let out = Fixture::new(&[("README.md", line.as_bytes())]).generic_gate();
+    assert_eq!(out.status.code(), want, "a file, {text:?}: {}", show(&out));
+
+    let fx = Fixture::new(&[("a.txt", b"clean\n")]);
+    let msg = fx.tmp.path().join("msg");
+    fs::write(&msg, &line).unwrap();
+    let out = fx.gate_in(
+        &fx.repo(),
+        None,
+        &["--generic-only", "message", msg.to_str().unwrap()],
+    );
+    assert_eq!(
+        out.status.code(),
+        want,
+        "a message, {text:?}: {}",
+        show(&out)
+    );
+}
+
+/// A path from the home directory into a folder of the owner's own is refused, in a file, in a
+/// message, or in a tracked path.  A dot-folder names tool state and passes, and so does a folder
+/// every home has, which names the same place for every reader, and a placeholder such as
+/// `~/<folder>`.  The maintainer ruled this line on 4-Nov-2026.
 #[test]
 fn generic_layer_refuses_a_path_from_the_home_directory() {
     let refused = [
@@ -1151,36 +1179,214 @@ fn generic_layer_refuses_a_path_from_the_home_directory() {
         ["$HOME", "Projects"].join("/"),
         ["${HOME}", "Projects", "x"].join("/"),
         format!("concat!(env!({}), {})", "\"HOME\"", "\"/Projects/x\""),
+        // A quote on either side of the `/`; more than one `/`; `.` and `..` before a `/`, which
+        // hide the folder after them; a placeholder that does not start like one; a folder every
+        // home has, in another case; and a folder whose name only starts like one.
+        ["\"$HOME\"", "Projects"].join("/"),
+        ["~", "'Projects'", "x"].join("/"),
+        ["~", "", "Projects", "x"].join("/"),
+        ["$HOME", "", "Projects"].join("/"),
+        ["~", ".", "Projects"].join("/"),
+        ["$HOME", "..", "bob"].join("/"),
+        ["~", "new_dir"].join("/"),
+        ["~", "documents"].join("/"),
+        ["~", "Documents.", "private"].join("/"),
+        ["~", "Documents.old"].join("/"),
     ];
-    let passed = [
+    let mut passed = vec![
         ["~", ".config", "leak-gate"].join("/"),
         ["$HOME", ".cargo", "bin"].join("/"),
         format!("concat!(env!({}), {})", "\"HOME\"", "\"/.cargo/bin\""),
+        ["~", "Library", "Application Support", "x"].join("/"),
+        ["~", "'Documents'", "x"].join("/"),
+        format!("files in {}.", ["~", "Downloads"].join("/")),
+        // A standard folder followed by the punctuation of prose that is not ASCII.
+        format!("the folder “{}” holds it", ["~", "Documents"].join("/")),
+        format!(
+            "‘{}’, and {}—which is standard",
+            ["~", "Library"].join("/"),
+            ["~", "Music"].join("/")
+        ),
+        format!(
+            "{}… and {}!",
+            ["~", "Pictures"].join("/"),
+            ["~", "Desktop"].join("/")
+        ),
+        // Dot-folders by a glob, and `.` or `..` at the end of a path.
+        "ls -d ~/.* ~/.[!.]* ~/.??* $HOME/.{bashrc,zshrc}".to_string(),
+        ["~", "...", "x"].join("/"),
+        "Copy it to ~/.".to_string(),
         "~/<folder>/x".to_string(),
+        "cd ~/$dir, or ~/%s".to_string(),
         "the home directory, ~/, alone".to_string(),
         "about ~ 3 seconds".to_string(),
     ];
+    for standard in [
+        "Applications",
+        "AppData",
+        "Desktop",
+        "Documents",
+        "Downloads",
+        "Library",
+        "Movies",
+        "Music",
+        "Pictures",
+        "Public",
+        "Templates",
+        "Videos",
+        "go",
+    ] {
+        passed.push(["${HOME}", standard, "x"].join("/"));
+    }
     for (texts, want) in [(&refused[..], Some(3)), (&passed[..], Some(0))] {
         for text in texts.iter() {
-            let line = format!("see {text}\n");
-            let out = Fixture::new(&[("README.md", line.as_bytes())]).generic_gate();
-            assert_eq!(out.status.code(), want, "a file, {text:?}: {}", show(&out));
-
-            let fx = Fixture::new(&[("a.txt", b"clean\n")]);
-            let msg = fx.tmp.path().join("msg");
-            fs::write(&msg, &line).unwrap();
-            let out = fx.gate_in(
-                &fx.repo(),
-                None,
-                &["--generic-only", "message", msg.to_str().unwrap()],
-            );
-            assert_eq!(
-                out.status.code(),
-                want,
-                "a message, {text:?}: {}",
-                show(&out)
-            );
+            assert_in_a_file_and_a_message(text, want);
         }
+    }
+
+    // In a tracked path, with the home `.claude` folder, which no other rule reads in a path.
+    let path = ["$HOME", ".claude", "rules.md"].join("/");
+    let out = Fixture::new(&[(path.as_str(), b"clean\n")]).generic_gate();
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        format!(
+            "leak: path into the home .claude folder in a path: {path}:{}\n",
+            ["$HOME", ".claude"].join("/")
+        ),
+        "{}",
+        show(&out)
+    );
+    for (path, want) in [
+        (["~", "Projects", "notes.txt"].join("/"), Some(3)),
+        // git quotes a path holding `"`, and the quote's `\` hid the folder.
+        (["~", "\"Projects\"", "notes.txt"].join("/"), Some(3)),
+        (["~", ".config", "x.toml"].join("/"), Some(0)),
+    ] {
+        let out = Fixture::new(&[(path.as_str(), b"clean\n")]).generic_gate();
+        assert_eq!(out.status.code(), want, "a path, {path:?}: {}", show(&out));
+    }
+}
+
+/// The finding showed `~/` and one character, and in a UTF-8 locale a first character that is not
+/// ASCII was reported twice: once as a character, and once as its first byte.  A space that is not
+/// ASCII ended the folder in the UTF-8 pass alone, which reported it twice too.
+#[test]
+fn a_path_from_the_home_directory_is_reported_whole_and_once() {
+    for (line, finding) in [
+        (
+            format!("see {}\n", ["~", "Ōla", "x"].join("/")),
+            ["~", "Ōla", ""].join("/"),
+        ),
+        (
+            format!("see {}\u{2003}now\n", ["~", "Proj"].join("/")),
+            format!("{}\u{2003}now", ["~", "Proj"].join("/")),
+        ),
+    ] {
+        let fx = Fixture::new(&[("README.md", line.as_bytes())]);
+        let empty = fx.tmp.path().join("empty-patterns.txt");
+        fs::write(&empty, "").unwrap();
+        let out = fx.gate_env(&fx.repo(), Some(&empty), &[], &[("LC_ALL", "C.UTF-8")]);
+        assert_eq!(
+            String::from_utf8_lossy(&out.stdout),
+            format!("leak: path from the home directory: README.md:1:{finding}\n"),
+            "{line:?}: {}",
+            show(&out)
+        );
+    }
+}
+
+/// Two bytes start a path from the home directory, so a large image holds one by chance, and every
+/// such file was refused.  A file is binary by its content: a `-diff` attribute does not hide a text
+/// file.
+#[test]
+fn the_home_directory_rule_skips_a_binary_file() {
+    let image = [
+        &b"\x89PNG\r\n\x1a\n\0"[..],
+        ["~", "Qx"].join("/").as_bytes(),
+    ]
+    .concat();
+    let out = Fixture::new(&[("a.png", &image[..])]).generic_gate();
+    assert_eq!(out.status.code(), Some(0), "{}", show(&out));
+
+    let text = format!("see {}\n", ["~", "Projects", "x"].join("/"));
+    let out = Fixture::new(&[
+        ("a.pbxproj", text.as_bytes()),
+        (".gitattributes", b"*.pbxproj -crlf -diff -merge\n"),
+    ])
+    .generic_gate();
+    assert_eq!(out.status.code(), Some(3), "{}", show(&out));
+}
+
+/// An address in the owner's task roster spells folders on the owner's drive, which the maintainer
+/// ruled on 4-Nov-2026 never go public.
+#[test]
+fn generic_layer_refuses_a_roster_address_that_spells_a_path() {
+    for text in [
+        format!("ask `{}`", ["row:App", "Rust", "x", "0027"].join("/")),
+        ["(row:x", "r0001)"].join("/"),
+    ] {
+        assert_in_a_file_and_a_message(&text, Some(3));
+    }
+    for text in [
+        "row:. alone",
+        "arrow:a/b",
+        "my_row:x/y",
+        ".a{grid-row:1/3}",
+        ".a{grid-row:auto/span 2}",
+        "processing row:12/40",
+        "row: 3/4",
+        "Cell { row:x, col:y }",
+    ] {
+        assert_in_a_file_and_a_message(text, Some(0));
+    }
+
+    // After a curly quote, reported once.
+    let address = ["row:App", "Rust", "x", "0027"].join("/");
+    let fx = Fixture::new(&[("README.md", format!("ask “{address}”\n").as_bytes())]);
+    let empty = fx.tmp.path().join("empty-patterns.txt");
+    fs::write(&empty, "").unwrap();
+    let out = fx.gate_env(&fx.repo(), Some(&empty), &[], &[("LC_ALL", "C.UTF-8")]);
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout).lines().count(),
+        1,
+        "{}",
+        show(&out)
+    );
+
+    // In a tracked path.
+    let path = ["notes", "row:App", "x.md"].join("/");
+    let out = Fixture::new(&[(path.as_str(), b"clean\n")]).generic_gate();
+    assert_eq!(out.status.code(), Some(3), "{path:?}: {}", show(&out));
+}
+
+/// The filter that lets the test fixtures' `alice` pass ran in a command substitution whose status
+/// was never read, so a grep that failed there read as no absolute home path, and exit 0.
+#[test]
+fn a_failing_filter_is_exit_1() {
+    let fx = Fixture::new(&[("a.txt", format!("see {}\n", home_path()).as_bytes())]);
+    let real = ["/usr/bin/grep", "/bin/grep"]
+        .into_iter()
+        .find(|p| Path::new(p).exists())
+        .unwrap();
+    let bin = fx.tmp.path().join("bin");
+    fs::create_dir(&bin).unwrap();
+    let shim = bin.join("grep");
+    fs::write(
+        &shim,
+        format!(
+            "#!/bin/sh\nfor a in \"$@\"; do case $a in *'alice$') exit 2 ;; esac; done\nexec {real} \"$@\"\n"
+        ),
+    )
+    .unwrap();
+    fs::set_permissions(&shim, fs::Permissions::from_mode(0o755)).unwrap();
+    let path = format!("{}:{}", bin.display(), std::env::var("PATH").unwrap());
+    let empty = fx.tmp.path().join("empty-patterns.txt");
+    fs::write(&empty, "").unwrap();
+    let msg = fx.tmp.path().join("msg");
+    fs::write(&msg, format!("see {}\n", home_path())).unwrap();
+    for args in [&[][..], &["message", msg.to_str().unwrap()][..]] {
+        let out = fx.gate_env(&fx.repo(), Some(&empty), args, &[("PATH", path.as_str())]);
+        assert_eq!(out.status.code(), Some(1), "{args:?}: {}", show(&out));
     }
 }
 

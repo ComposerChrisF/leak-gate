@@ -10,7 +10,8 @@
 #                names them on stderr each run.  Without that file every tracked file is scanned,
 #                and a new file is scanned by default, so the gate fails closed.  A binary file is
 #                matched byte for byte, so text in it stored as UTF-16 or in a compressed stream is
-#                not seen, and a home path or a private name in it is reported as the whole file.
+#                not seen, and an absolute home path or a private name in it is reported as the
+#                whole file.
 #   a message    `message <file>`: every line of one commit message file, for a `commit-msg` hook.
 #                git hands the hook the message before its cleanup, and the hook cannot tell which
 #                lines git will keep: git keeps comment lines for `-m` and `-F`, and a `--cleanup`
@@ -32,13 +33,37 @@
 # Two layers, each over what is scanned:
 #   generic  Committed here, and run by CI and by the hooks.  It refuses:
 #              - an absolute home path other than the test fixtures' `alice` (`/Users/<name>`,
-#                `/home/<name>`, `C:\Users\<name>`; the exception cannot apply to a binary file);
-#              - a path into the home directory's `.claude` folder (`~`, `$HOME`, or `${HOME}`);
-#              - a path from the home directory into a folder that is not a dot-folder
-#                (`~/<folder>`, `$HOME/<folder>`, `${HOME}/<folder>`, and Rust's `env!("HOME")`
-#                followed on the same line by `, "/<folder>`): a dot-folder such as `~/.config`
-#                names tool state, any other the owner's own files.  The home directory reached
-#                another way, such as `std::env::var("HOME")`, is not seen;
+#                `/home/<name>`, `C:\Users\<name>`; the exception cannot apply to a binary file),
+#                in a file's contents or in a message: a tracked file's path is relative, and a
+#                folder named `home` or `Users` in it is the repository's own;
+#              - a path into the home directory's `.claude` folder (`~`, `$HOME`, or `${HOME}`, with
+#                or without a quote on either side of the `/`);
+#              - a path from the home directory (`~/<folder>`, `$HOME/<folder>`, `${HOME}/<folder>`,
+#                with one or more `/` and with or without a quote on either side of them, and
+#                Rust's `env!("HOME")` followed on the same line by `, "/<folder>`) into a folder
+#                of the owner's own.  Only the first folder is read, byte for byte, up to an ASCII
+#                space, a `/`, an ASCII quote, or other ASCII punctuation that ends a path in prose
+#                (such as `,`, `;`, `:`, `)`, or `?`).  It passes when it is a dot-folder such as
+#                `~/.config`, which names tool state, or a folder on a fixed list of the standard
+#                folders of a home on macOS, Linux, or Windows, which name the same place for every
+#                reader: Applications, AppData, Desktop, Documents, Downloads, Library, Movies,
+#                Music, Pictures, Public, Templates, Videos, and Go's `go`, each spelled in that
+#                case.  A standard folder that ends the path may be followed by `.` and `!`, which
+#                end a sentence, and then by any character that is not ASCII, such as a curly quote
+#                or a dash, and what follows it up to the next `/`.  `.` and `..` followed by a `/`
+#                are not dot-folders, since they hide the folder after them; followed by anything
+#                else, as in `~/.*` or `Copy it to ~/.`, they name the home directory, its
+#                dot-folders, or its parent, and pass.  A placeholder passes when it starts with a
+#                character the folder cannot, such as `<`, `$`, `%`, `{`, `[`, or `*` (`~/<folder>`,
+#                `~/$dir`, `~/%s`); any other, such as a folder named `new_dir`, is refused.  A
+#                binary file is skipped, since two bytes start the pattern and a large image holds
+#                them by chance: binary by its content, as git tells it with the repository's
+#                `.gitattributes` ignored, so no committed attribute hides a text file.  The home
+#                directory reached another way, such as `std::env::var("HOME")`, is not seen;
+#              - an address in the owner's task roster that spells a path, `row:` and then a folder
+#                starting with a letter, and a `/` (`row:<folder>/<id>`), not after a letter, a
+#                digit, `_`, or `-`: its folders are on the owner's drive.  A short address that
+#                names no folder above the repository is written without `row:` (`<repo>/<id>`);
 #              - a bug or plan ID citation, in a file's contents or path or in a message, that a
 #                history cut from its predecessor's cannot resolve: an ID that is not four digits
 #                at or above its series' floor, or any ID of a series with no floor.  An ID counts
@@ -269,7 +294,10 @@ join_matches() {
     out=$(printf '%s\n%s\n' "$1" "$2" | LC_ALL=C sort -u | LC_ALL=C sed '/^$/d')
 }
 
-# Sets $out to grep's matches over a text, the same way as grep_index below.
+# Sets $out to grep's matches over a text, the same way as grep_index below.  The home-directory and
+# roster searches are run with LC_ALL=C, so that both passes read bytes: neither ignores case, and a
+# UTF-8 pass would end a folder at a space that is not ASCII, or report a character before `row:`
+# whole where the C pass reports its last byte.
 grep_text() {
     local text=$1 a b status
     shift
@@ -282,17 +310,52 @@ grep_text() {
     join_matches "$a" "$b"
 }
 
+# Drops from $out each match of the expression $1, byte for byte.
+drop_matches() {
+    local status
+    out=$(printf '%s\n' "$out" | LC_ALL=C grep -a -v -E "$1")
+    status=$?
+    [ "$status" -le 1 ] || { echo "leak-gate: grep failed (exit $status)" >&2; exit 1; }
+}
+
+# Sets $out to the matches in $out of a `grep -n` over $paths, each after the path it is in, since
+# grep numbers each path as a line.
+with_paths() {
+    local n match hits=""
+    while IFS=: read -r n match; do
+        [ -n "$n" ] && hits+="${path_list[n - 1]}:$match"$'\n'
+    done <<<"$out"
+    out=${hits%$'\n'}
+}
+
 # A user name is any run of characters up to a separator, a space, or the punctuation that ends a
 # path in prose, so a name that is not ASCII is caught too.
 name="[^][:space:]/\\\\<>\"'\`(){}|*?:,;[]+"
 home_re='(/(Users|home)/|[A-Za-z]:\\\\?Users\\\\?)'"$name"
 alice_re=':(/(Users|home)/|[A-Za-z]:\\\\?Users\\\\?)alice$'
-claude_re='(~|[$]HOME|[$][{]HOME[}])/[.]claude'
 
-# A folder's first character, as a user name's above but never a `.`, which starts a dot-folder.
-folder="[^].[:space:]/\\\\<>\"'\`(){}|*?:,;[]"
-home_folder_re='(~|[$]HOME|[$][{]HOME[}])/'"$folder"
+# The home directory and the `/` after it, with or without a quote on either side of the `/`, as in
+# `"$HOME"/<folder>` or `~/'<folder>'`, and with any number of `/`, which name the same place.
+home_dir="(~|[\$]HOME|[\$][{]HOME[}])[\"']?/+[\"']?"
+claude_re="$home_dir[.]claude"
+
+# A folder's whole name, so that a finding shows it, and the `/` after it when there is one: a user
+# name's characters, as above, but never starting with `$` or `%`, which start a placeholder such as
+# `~/$dir` or `~/%s`.
+folder="[^][:space:]/\\\\<>\"'\`(){}|*?:,;\$%[][^][:space:]/\\\\<>\"'\`(){}|*?:,;[]*/?"
+home_folder_re="$home_dir$folder"
 env_home_re='env![[:space:]]*\([[:space:]]*"HOME"[[:space:]]*\)[[:space:]]*,[[:space:]]*"/'"$folder"
+
+# A match the home-directory rule lets pass, by the folder at its end:
+#   - a dot-folder, but `.` or `..` only at the end, with no `/` after it;
+#   - a standard folder, followed by a `/`, or at the end by `.` and `!`, which end a sentence, and
+#     by a byte that is not printable ASCII and anything after it, such as a curly quote or a dash.
+standard='Applications|AppData|Desktop|Documents|Downloads|Library|Movies|Music|Pictures|Public|Templates|Videos|go'
+passing_re="/[\"']?([.][^/]*|([.][^./]|[.][.][^/])[^/]*/|($standard)(/|[.!]*([^ -~][^/]*)?))\$"
+
+# A roster address that spells a path: `row:`, not after a letter, digit, `_`, or `-`, then a folder
+# starting with a letter, and a `/`.  The `:` is in brackets so that this line does not match itself.
+row_re="(^|[^[:alnum:]_-])row[:][[:alpha:]][^][:space:]/\\\\<>\"'\`(){}|*?:,;[]*/"
 
 # An ID, after the start of a line or a character that is not a letter or digit, so `_` separates
 # words.  Matched with LC_ALL=C, byte for byte, so a letter that is not ASCII separates words too,
@@ -355,7 +418,7 @@ grep_index() {
 }
 
 scan_index() {
-    local line n match hits path_list
+    local line path_list empty_tree
     scope=(-- .)
     read_tracked .leak-gate-exclude
     significant
@@ -366,34 +429,55 @@ scan_index() {
         echo "leak-gate: not scanning what .leak-gate-exclude lists: $(tr '\n' ' ' <<<"$lines")" >&2
     fi
 
-    # A tracked file's path is published too.  Unquoted, so a name that is not ASCII stays itself.
-    paths=$(git -c core.quotePath=false ls-files --cached "${scope[@]}") || { echo "leak-gate: git ls-files failed" >&2; exit 1; }
+    # A tracked file's path is published too.  Read as git stores it (-z), since git quotes a name
+    # holding a byte that is not ASCII, `"`, `\`, or a control character, and a quote's `\` would
+    # hide a home path after it.
+    paths=$(git ls-files -z --cached "${scope[@]}" | LC_ALL=C tr '\0' '\n') || { echo "leak-gate: git ls-files failed" >&2; exit 1; }
     if [ -z "$paths" ]; then
         all=$(git ls-files --cached) || { echo "leak-gate: git ls-files failed" >&2; exit 1; }
         [ -z "$all" ] || { echo "leak-gate: .leak-gate-exclude leaves nothing to scan" >&2; exit 1; }
     fi
 
+    # git's -I takes a `binary` or `-diff` attribute for binary too, so the attributes are read from
+    # the empty tree: a file is binary by its content alone.
+    empty_tree=$(git hash-object -t tree /dev/null) || { echo "leak-gate: git hash-object failed" >&2; exit 1; }
+
     grep_index -o -E "$home_re"
-    report "absolute home path" "$(printf '%s\n' "$out" | grep -v -E "$alice_re")"
+    drop_matches "$alice_re"
+    report "absolute home path" "$out"
 
     grep_index -E "$claude_re"
     report "path into the home .claude folder" "$out"
 
-    grep_index -o -E -e "$home_folder_re" -e "$env_home_re"
+    LC_ALL=C GIT_ATTR_SOURCE=$empty_tree grep_index -I -o -E -e "$home_folder_re" -e "$env_home_re"
+    drop_matches "$passing_re"
     report "path from the home directory" "$out"
+
+    LC_ALL=C grep_index -o -E "$row_re"
+    report "roster address" "$out"
 
     LC_ALL=C grep_index -a -o -E "$id_re"
     report "bug or plan ID citation" "$(below_floor "$out")"
 
-    # grep -n numbers the matches by path, so each is reported with its path.
-    LC_ALL=C grep_text "$paths" -a -n -o -E "$id_re"
     path_list=()
     while IFS= read -r line; do path_list+=("$line"); done <<<"$paths"
-    hits=""
-    while IFS=: read -r n match; do
-        [ -n "$n" ] && hits+="${path_list[n - 1]}:$match"$'\n'
-    done <<<"$out"
-    report "bug or plan ID in a path" "$(below_floor "$hits")"
+
+    grep_text "$paths" -a -n -o -E "$claude_re"
+    with_paths
+    report "path into the home .claude folder in a path" "$out"
+
+    LC_ALL=C grep_text "$paths" -a -n -o -E "$home_folder_re"
+    with_paths
+    drop_matches "$passing_re"
+    report "path from the home directory in a path" "$out"
+
+    LC_ALL=C grep_text "$paths" -a -n -o -E "$row_re"
+    with_paths
+    report "roster address in a path" "$out"
+
+    LC_ALL=C grep_text "$paths" -a -n -o -E "$id_re"
+    with_paths
+    report "bug or plan ID in a path" "$(below_floor "$out")"
 
     # A refused kind of file, by the end of its name, outside the folders allowed it.  The names are
     # read as git stores them (-z): git quotes a name holding `"`, `\`, or a control character
@@ -435,13 +519,18 @@ label() {
 scan_text() {
     local where=$1 text=$2
     grep_text "$text" -a -n -o -E "$home_re"
-    report "absolute home path" "$(label "$where" "$(printf '%s\n' "$out" | grep -a -v -E "$alice_re")")"
+    drop_matches "$alice_re"
+    report "absolute home path" "$(label "$where" "$out")"
 
     grep_text "$text" -a -n -E "$claude_re"
     report "path into the home .claude folder" "$(label "$where" "$out")"
 
-    grep_text "$text" -a -n -o -E -e "$home_folder_re" -e "$env_home_re"
+    LC_ALL=C grep_text "$text" -a -n -o -E -e "$home_folder_re" -e "$env_home_re"
+    drop_matches "$passing_re"
     report "path from the home directory" "$(label "$where" "$out")"
+
+    LC_ALL=C grep_text "$text" -a -n -o -E "$row_re"
+    report "roster address" "$(label "$where" "$out")"
 
     LC_ALL=C grep_text "$text" -a -n -o -E "$id_re"
     report "bug or plan ID citation" "$(label "$where" "$(below_floor "$out")")"
