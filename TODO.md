@@ -4,7 +4,8 @@ The order of open work.
 
 ## Open
 
-- [ ] **Publish this repository** as `ComposerChrisF/leak-gate`, public, and run its CI.  It waits on the maintainer.
+- [x] **Published** as `ComposerChrisF/leak-gate`, public, on 4-Nov-2026 at 0.6.0; its first CI passed.
+- [ ] [plan-0001](plans/plan-0001-read-a-home-path-that-rustfmt-splits-across-lines.md) — **read a home path that rustfmt splits across lines**: `concat!(` / `env!("HOME"),` / `"/<folder>/…"` passes the generic layer today, so CI passes it in any repository.
 - [ ] **A pre-push hook:** `leak-gate range` over what each pushed ref adds, both layers, so that commits no `commit-msg` hook sees (cherry-pick, rebase, `am`, `--no-verify`) and every tag message are read for private names before they leave the machine.
 - [ ] **The file-type rule over history:** `range` reads only messages, so a refused file committed and later removed is published unseen.  Apply the rule to the names each commit in a range adds (`git diff-tree --name-only`).
 - [ ] **More spellings of the home directory:** the home-directory rule reads `~`, `$HOME`, and `${HOME}`, but not `${HOME:?}` or `${HOME:-<default>}` (the form shellcheck asks for before `rm -rf`), nor `~<user>/`, which names a user as `/Users/<name>` does.  Decide whether each belongs in the generic layer.
