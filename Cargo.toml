@@ -1,6 +1,6 @@
 [package]
 name = "leak-gate"
-version = "0.6.0"
+version = "0.6.1"
 edition = "2021"
 # The gate is a shell script, `scripts/leak-gate`; this package only runs its tests.  Repositories
 # take the script at a pinned commit, never from crates.io.
@@ -14,3 +14,24 @@ tempfile = "3"
 
 [target.'cfg(unix)'.dev-dependencies]
 libc = "0.2"
+
+# house-lints v1 (2026-11-14) — the [lints] table, to paste into Cargo.toml.
+# A single crate: paste as is.  A workspace: rename the table to
+# [workspace.lints.clippy] in the root manifest, and put `[lints] workspace = true`
+# in each member.  Every level is "warn": existing violations do not block, and
+# review refuses new ones.  The canonical copy lives in Chris's coding hub, under
+# house-lints/.
+
+[lints.clippy]
+# Every suppression says why, and an #[expect] warns once its lint stops firing.
+allow_attributes = "warn"
+allow_attributes_without_reason = "warn"
+# No panics on input in production code (tests are allowed by clippy.toml).
+unwrap_used = "warn"
+expect_used = "warn"
+panic = "warn"
+# Each of these caught a filed bug in the 2026-11-14 census.
+string_slice = "warn"
+let_underscore_must_use = "warn"
+undocumented_unsafe_blocks = "warn"
+# disallowed_methods is on by default; its list is clippy.toml.
